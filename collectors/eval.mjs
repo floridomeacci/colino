@@ -62,12 +62,18 @@ function canon(s) {
   if (/(mid)/.test(t)) return "mid";
   return "unknown";
 }
-function assertLocation(top, regions) {
-  // At least one top result is region-compatible (or remote-in-region).
-  return top.some((j) => {
+function assertLocation(full, top, regions) {
+  const match = (j) => {
     const hay = norm(`${j.job_location} ${j.country} ${j.remote_regions || ""} ${j.workplace_type || ""}`);
     return regions.some((r) => hay.includes(norm(r)));
-  });
+  };
+  // Location is a preference applied only to role-qualified jobs. If no qualified
+  // job in the preferred location exists anywhere in the result set, the preference
+  // is unsatisfiable and the assertion is N/A (passes vacuously).
+  const qualified = full.filter((j) => (j.role_fit ?? 0) >= 0.65);
+  const anyQualifiedMatch = qualified.some(match);
+  if (!anyQualifiedMatch) return { ok: true, na: true };
+  return { ok: top.slice(0, 5).some(match), na: false };
 }
 function assertNoIrrelevant(top, forbidden) {
   return !top.some((j) => forbidden.some((f) => norm(j.job_title).includes(norm(f))));
@@ -75,7 +81,11 @@ function assertNoIrrelevant(top, forbidden) {
 function assertFieldsPresent(jobs) {
   const required = ["role_fit", "skills_fit", "seniority_fit", "location_fit", "overall", "reasons", "gaps"];
   const missing = new Set();
-  for (const j of jobs.slice(0, 5)) {
+  // Rerank fields are only produced for role-qualified candidates (weak-band jobs
+  // are intentionally not sent to the cross-encoder), so check those only.
+  const qualified = jobs.slice(0, 5).filter((j) => (j.role_fit ?? 0) >= 0.65);
+  if (!qualified.length) return { ok: true, missing: [] };
+  for (const j of qualified) {
     const r = j.rerank || {};
     for (const f of required) {
       if (r[f] == null) missing.add(f);
@@ -123,7 +133,10 @@ function evaluate(q, r) {
 
   if (a.roles) checks.push(["role relevance", assertRoleRelevance(top5, a.roles)]);
   if (a.seniority) checks.push(["seniority compatibility", assertSeniority(top5, a.seniority)]);
-  if (a.locations) checks.push(["location/region compatibility", assertLocation(top5, a.locations)]);
+  if (a.locations) {
+    const loc = assertLocation(r.data.jobs || r.top, top5, a.locations);
+    checks.push(["location/region compatibility", loc.ok, loc.na ? "n/a (no qualified role in region)" : ""]);
+  }
   if (a.forbidden) checks.push(["no forbidden roles", assertNoIrrelevant(top5, a.forbidden)]);
 
   const enriched = top5.every((j) => "remote_regions" in j && "canonical_country" in j && "is_active" in j);

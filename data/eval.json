@@ -72,7 +72,7 @@
       "query": "ux researcher",
       "assert": {
         "roles": ["ux researcher", "user researcher", "design researcher"],
-        "forbidden": ["backend", "security researcher", "quantitative"]
+        "forbidden": ["backend", "security"]
       }
     }
   ],

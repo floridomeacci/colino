@@ -615,6 +615,9 @@ function keywordRank(query, jobs) {
   return scored;
 }
 __name(keywordRank, "keywordRank");
+// Role gate thresholds (role identity is decided before any location/preference).
+const ROLE_FIT_ELIGIBLE = 0.5;   // below this the job does not share the role family: exclude.
+const ROLE_FIT_QUALIFIED = 0.65; // at/above this the job is a solid role match: full location.
 // Hybrid retrieval + weighted relevance + preference rerank.
 // Returns an array of jobs with { score, relevance, reasons, gaps, location_tier }.
 async function hybridRank(env, intent, jobs, opts = {}) {
@@ -646,7 +649,11 @@ async function hybridRank(env, intent, jobs, opts = {}) {
     const h = hybridScore(job, intent, titleVecs[i], descVecs[i], qTitleVec, qDescVec);
     if (h === -1) continue; // excluded
     if (h.base < MIN_RELEVANCE) continue;
-    result.push({ ...job, relevance: h.base, score: h.base * 100, breakdown: h });
+    // Deterministic role gate: a job must share the requested role family before
+    // location or any preference can help it. Weak (partial) role matches are kept
+    // but their location preference is dampened below.
+    if (h.roleFit < ROLE_FIT_ELIGIBLE) continue;
+    result.push({ ...job, relevance: h.base, score: h.base * 100, breakdown: h, role_fit: h.roleFit });
   }
 
   // Preference rerank (capped, applied only after relevance).
@@ -658,8 +665,12 @@ async function hybridRank(env, intent, jobs, opts = {}) {
   for (const j of result) {
     const { bonus: locBonus, tier } = locationTier(intent, j);
     j.location_tier = tier;
+    // Role gate on location: a weak role match gets a muted location preference so
+    // nearby-but-irrelevant jobs cannot leapfrog true role matches.
+    let effectiveBonus = locBonus;
+    if (j.role_fit < ROLE_FIT_QUALIFIED) effectiveBonus *= 0.25;
     // Cap location influence to ±0.08 and feedback to ±0.04 on the 0-1 relevance scale.
-    let adj = Math.max(-0.08, Math.min(0.08, locBonus / 100));
+    let adj = Math.max(-0.08, Math.min(0.08, effectiveBonus / 100));
     if (likeSet.has(j.url)) adj += 0.04;
     else if (likeCompanies.has(normalizeCompanyName(j.company_name))) adj += 0.02;
     if (disSet.has(j.url)) adj -= 0.04;
@@ -724,9 +735,18 @@ function llmModelName(env) {
 }
 __name(llmModelName, "llmModelName");
 async function rerankWithLLM(env, intent, candidates) {
-  const top = candidates.slice(0, 30);
   const meta = { rerank_status: "skipped", rerank_model: llmModelName(env), candidates_reranked: 0 };
-  if (!top.length) return { jobs: candidates, meta };
+  // Role gate on the cross-encoder: only solid role matches (qualified band) are
+  // eligible for LLM reordering. Weak/adjacent role matches keep their deterministic
+  // order below the qualified set, so the LLM (or location) can never promote a
+  // nearby-but-different role above a true role match.
+  const qualified = candidates.filter((j) => (j.role_fit ?? 0) >= ROLE_FIT_QUALIFIED);
+  const weak = candidates.filter((j) => (j.role_fit ?? 0) < ROLE_FIT_QUALIFIED);
+  const top = qualified.slice(0, 30);
+  if (!top.length) {
+    meta.rerank_status = "skipped";
+    return { jobs: [...qualified, ...weak], meta };
+  }
   const rows = top.map((j, i) => `${i} | ${j.job_title} | ${j.company_name} | ${j.job_location || ""} | ${j.job_seniority || "unknown"} | tier=${j.location_tier || "unknown"}`).join("\n");
   const system = `You are a job relevance reranker. Given a candidate's structured intent and a list of jobs, score each job's fit. Return ONLY a JSON object, no markdown, shaped as:
 {"results":[{"idx":0,"role_fit":0.88,"skills_fit":0.81,"seniority_fit":0.72,"location_fit":1,"overall":0.84,"reasons":["..."],"gaps":["..."]}]}
@@ -742,26 +762,27 @@ Location rules: each row ends with a precomputed "tier". exact_city and compatib
   }
   if (!parsed || !Array.isArray(parsed.results)) {
     meta.rerank_status = "failed";
-    return { jobs: candidates, meta };
+    return { jobs: [...qualified, ...weak], meta };
   }
   const byIdx = new Map(parsed.results.map((r) => [Number(r.idx), r]));
-  for (let i = 0; i < candidates.length; i++) {
+  for (let i = 0; i < top.length; i++) {
     const r = byIdx.get(i);
     if (r) {
-      candidates[i].rerank = {
+      top[i].rerank = {
         role_fit: r.role_fit, skills_fit: r.skills_fit, seniority_fit: r.seniority_fit,
         location_fit: r.location_fit, overall: r.overall, reasons: r.reasons || [], gaps: r.gaps || []
       };
       // Preserve the pre-computed preference adjustment (location tier + feedback)
       // so the region/eligibility signal is never lost to the LLM's own estimate.
-      const adj = candidates[i].preference_adjustment || 0;
-      candidates[i].score = Math.round(((r.overall ?? candidates[i].relevance) + adj) * 100);
+      const adj = top[i].preference_adjustment || 0;
+      top[i].score = Math.round(((r.overall ?? top[i].relevance) + adj) * 100);
     }
   }
-  candidates.sort((a, b) => b.score - a.score);
+  top.sort((a, b) => b.score - a.score);
+  const rest = qualified.slice(30);
   meta.rerank_status = "completed";
   meta.candidates_reranked = parsed.results.length;
-  return { jobs: candidates, meta };
+  return { jobs: [...top, ...rest, ...weak], meta };
 }
 __name(rerankWithLLM, "rerankWithLLM");
 // ─── Job-data enrichment (remote regions, work authorization, canonical location) ───
@@ -1313,6 +1334,43 @@ async function getFieldEmbeddings(env, jobs, field, textFn) {
   return vecs;
 }
 __name(getFieldEmbeddings, "getFieldEmbeddings");
+// Role-word synonyms so role identity is taxonomy-based, not exact-title-based.
+// e.g. "design leader" must recognize "lead designer", "head of design", "design director".
+const ROLE_WORD_VARIANTS = {
+  leader: ["leader", "lead", "head"],
+  lead: ["lead", "leader", "head"],
+  head: ["head", "lead", "leader"],
+  director: ["director", "head"],
+  designer: ["designer", "design"],
+  design: ["design", "designer"],
+  developer: ["developer", "development", "dev"],
+  development: ["development", "developer", "dev"],
+  technologist: ["technologist", "technology", "tech"],
+  technology: ["technology", "technologist", "tech"],
+  analyst: ["analyst", "analytics", "analysis"],
+  analytics: ["analytics", "analyst", "analysis"],
+  analysis: ["analysis", "analyst", "analytics"],
+  researcher: ["researcher", "research"],
+  research: ["research", "researcher"],
+  manager: ["manager", "management"],
+  management: ["management", "manager"],
+  engineer: ["engineer", "engineering"],
+  engineering: ["engineering", "engineer"],
+  architect: ["architect", "architecture"],
+  architecture: ["architecture", "architect"],
+  strategist: ["strategist", "strategy"],
+  strategy: ["strategy", "strategist"]
+};
+function roleWordHits(title, role) {
+  const words = String(role || "").toLowerCase().split(/[^a-z0-9+#]+/).filter((w) => w.length >= 2);
+  let hit = 0;
+  for (const w of words) {
+    const variants = ROLE_WORD_VARIANTS[w] || [w];
+    if (variants.some((v) => title.includes(v))) hit++;
+  }
+  return { hit, total: words.length };
+}
+__name(roleWordHits, "roleWordHits");
 // Hybrid relevance: role/title similarity, skills, responsibilities, seniority, industry, freshness.
 function hybridScore(job, intent, titleVec, descVec, qTitleVec, qDescVec) {
   const titleCos = qTitleVec ? cosineSimilarity(qTitleVec, titleVec) : 0;
@@ -1323,24 +1381,19 @@ function hybridScore(job, intent, titleVec, descVec, qTitleVec, qDescVec) {
   // Role/title fit (weighted role expansion). Lexical first; embedding only as a weak
   // supplementary signal, never a full fallback (embeddings cluster similar-sounding titles).
   let roleFit = 0;
-  const roleWords = (r) => r.toLowerCase().split(/[^a-z0-9+#]+/).filter((w) => w.length > 2);
   for (const r of intent.target_roles || []) {
     const rl = r.toLowerCase();
-    if (t.includes(rl)) { roleFit = Math.max(roleFit, 1); }
-    else {
-      const words = roleWords(r);
-      if (words.length && words.every((w) => t.includes(w))) roleFit = Math.max(roleFit, 0.8);
-      else if (words.some((w) => t.includes(w))) roleFit = Math.max(roleFit, 0.5);
-    }
+    if (t.includes(rl)) { roleFit = Math.max(roleFit, 1); continue; }
+    const { hit, total } = roleWordHits(t, r);
+    if (total && hit === total) roleFit = Math.max(roleFit, 0.8);
+    else if (hit > 0 && total > 0) roleFit = Math.max(roleFit, 0.5 * (hit / total));
   }
   for (const rr of intent.related_roles || []) {
     const rl = rr.role.toLowerCase();
-    if (t.includes(rl)) roleFit = Math.max(roleFit, rr.weight * 0.95);
-    else {
-      const words = roleWords(rr.role);
-      if (words.length && words.every((w) => t.includes(w))) roleFit = Math.max(roleFit, rr.weight * 0.75);
-      else if (words.some((w) => t.includes(w))) roleFit = Math.max(roleFit, rr.weight * 0.45);
-    }
+    if (t.includes(rl)) { roleFit = Math.max(roleFit, rr.weight * 0.95); continue; }
+    const { hit, total } = roleWordHits(t, rr.role);
+    if (total && hit === total) roleFit = Math.max(roleFit, rr.weight * 0.75);
+    else if (hit > 0 && total > 0) roleFit = Math.max(roleFit, rr.weight * 0.5 * (hit / total));
   }
   // Weak supplementary: title embedding similarity, capped and discounted.
   if (roleFit < 0.4) roleFit = Math.max(roleFit, titleCos * 0.5);
