@@ -671,14 +671,19 @@ async function handleDiscoveryStart(request, env, ctx) {
 __name(handleDiscoveryStart, "handleDiscoveryStart");
 async function runDiscovery(id, query, env) {
   try {
+    console.log("[discovery] runDiscovery started", id);
     const raw = await env.JOBS_KV.get(`disc:${id}`, { type: "json" });
     if (!raw) return;
+    // Transition queued -> processing immediately, before external work.
+    raw.status = "processing";
+    await env.JOBS_KV.put(`disc:${id}`, JSON.stringify(raw), { expirationTtl: 3600 });
     // Phase 1: propose companies.
     const system = "You are a company directory. Your ONLY job is to name 100 companies that employ people in a given field. A company is an employer: a firm, studio, agency, or corporation that has employees and posts job openings. Never output concepts, movements, styles, buildings, or individual people.\n\nOutput exactly one company name per line. No numbers, no dashes, no bullets, no explanations.\n\nFor the field \"architecture\", correct answers look like:\nFoster + Partners\nBIG\nOMA\nSnøhetta\nUNStudio\nMVRDV\nPerkins&Will\nGensler";
-    const rawText = await chatCompletion(env.REPLICATE_API_KEY, system, `Field: ${query}\n\nList 100 companies that employ people in this field:`, 4000);
+    console.log("[discovery] calling LLM (blocking)", id);
+    const rawText = await chatCompletionBlocking(env.REPLICATE_API_KEY, system, `Field: ${query}\n\nList 100 companies that employ people in this field:`, 4000);
+    console.log("[discovery] LLM returned", id, String(rawText).length);
     const companies = parseCompanyList(rawText).slice(0, 100);
     raw.companies = companies;
-    raw.status = companies.length ? "processing" : "complete";
     await env.JOBS_KV.put(`disc:${id}`, JSON.stringify(raw), { expirationTtl: 3600 });
     // Phase 2: fetch jobs for each company (batched to bound memory).
     for (const company of companies) {
@@ -691,6 +696,7 @@ async function runDiscovery(id, query, env) {
     }
     raw.status = "complete";
     await env.JOBS_KV.put(`disc:${id}`, JSON.stringify(raw), { expirationTtl: 3600 });
+    console.log("[discovery] complete", id, raw.jobs.length);
   } catch (err) {
     console.error("[discovery] background job failed:", err && err.message);
   }
@@ -905,6 +911,44 @@ async function chatCompletion(apiKey, system, prompt, maxTokens = 120) {
   return shortenReply(text);
 }
 __name(chatCompletion, "chatCompletion");
+// Blocking variant for background jobs (waitUntil): uses Prefer: wait so a single
+// fetch stays pending on Replicate's side instead of relying on setTimeout polling,
+// which Cloudflare suspends after the response returns.
+async function chatCompletionBlocking(apiKey, system, prompt, maxTokens = 120) {
+  const payload = {
+    input: {
+      prompt,
+      system_prompt: system,
+      top_p: 1,
+      max_tokens: maxTokens,
+      temperature: 0.1,
+      presence_penalty: 0,
+      frequency_penalty: 0
+    }
+  };
+  const res = await fetch("https://api.replicate.com/v1/models/deepseek-ai/deepseek-v3/predictions", {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+      "Prefer": "wait"
+    },
+    body: JSON.stringify(payload)
+  });
+  if (!res.ok) {
+    const errText = await res.text();
+    throw new Error(`Replicate API error ${res.status}: ${errText.slice(0, 200)}`);
+  }
+  const prediction = await res.json();
+  if (prediction.error) throw new Error(typeof prediction.error === "string" ? prediction.error : JSON.stringify(prediction.error));
+  if (prediction.status === "failed" || prediction.status === "canceled") {
+    throw new Error(prediction.error || `Prediction ${prediction.status}`);
+  }
+  const output = prediction.output;
+  let text = Array.isArray(output) ? output.join("") : String(output || "").trim();
+  return shortenReply(text);
+}
+__name(chatCompletionBlocking, "chatCompletionBlocking");
 function shortenReply(text) {
   if (!text) return "";
   return text
