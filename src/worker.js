@@ -242,29 +242,14 @@ async function handleMatchCV(request, env) {
     }
     const pool = await getAtsDb(env);
 
-    let scored = [];
-    let usedEmbeddings = false;
-    if (env.AI) {
-      try {
-        scored = await scoreWithEmbeddings(cvText, profile, pool, env);
-        usedEmbeddings = true;
-      } catch (e) {
-        usedEmbeddings = false;
-      }
-    }
-    if (!usedEmbeddings) {
-      for (const job of pool) {
-        const score = scoreJob(job, profile) - seniorityPenalty(profile.seniority, job.job_seniority_level);
-        if (score > 0) scored.push({ ...job, score });
-      }
-      scored.sort((a, b) => b.score - a.score);
-    }
+    const intent = buildIntentFromProfile(profile);
+    const scored = await hybridRank(env, intent, pool, {});
     return jsonResponse({
       matches: scored,
       profile,
       total: scored.length,
       atsCount: atsJobs.length,
-      usedEmbeddings
+      usedEmbeddings: true
     });
   } catch (err) {
     return jsonResponse({ error: err.message }, 500);
@@ -509,31 +494,15 @@ async function handleSearch(request, env) {
     const likes = new Set(sanitizeStringArray(body.likes, 500, 500));
     const dislikes = new Set(sanitizeStringArray(body.dislikes, 500, 500));
     const db = await getAtsDb(env);
-    const locationTags = tags.filter(isLocationTag);
     const query = tags.join(" ");
-    let scored;
-    if (env.AI) {
-      try {
-        scored = await semanticRank(query, db, env);
-      } catch (e) {
-        scored = keywordRank(query, db);
-      }
-    } else {
-      scored = keywordRank(query, db);
-    }
-
-    // Stage 1: lexical / term-overlap retrieval.
-    let mode = "lexical";
-    let gated = applyRelevanceGate(scored, tags);
-    // Stage 2: fallback to embedding-only retrieval with a semantic threshold.
-    if (!gated.length) {
-      gated = applySemanticThreshold(scored);
-      mode = "semantic_fallback";
-    }
-    // Stage 3: apply preferences only after the relevance threshold.
-    gated = applyVotes(gated, likes, dislikes);
-    gated = applyLocationFilter(gated, locationTags);
-    return jsonResponse({ jobs: gated.slice(0, 500), total: gated.length, search_mode: mode });
+    const intent = await parseQueryIntent(env, query);
+    const ranked = await hybridRank(env, intent, db, { likes, dislikes });
+    return jsonResponse({
+      jobs: ranked.slice(0, 500),
+      total: ranked.length,
+      search_mode: "hybrid",
+      intent: { target_roles: intent.target_roles, related_roles: intent.related_roles, exclude: intent.exclude }
+    });
   } catch (err) {
     return jsonResponse({ error: err && err.message ? err.message : String(err) }, err.status || 500);
   }
@@ -642,6 +611,59 @@ function keywordRank(query, jobs) {
   return scored;
 }
 __name(keywordRank, "keywordRank");
+// Hybrid retrieval + weighted relevance + preference rerank.
+// Returns an array of jobs with { score, relevance, reasons, gaps, location_tier }.
+async function hybridRank(env, intent, jobs, opts = {}) {
+  const { likes, dislikes } = opts;
+  const result = [];
+  const MIN_RELEVANCE = opts.minRelevance != null ? opts.minRelevance : 0.42;
+
+  // Embeddings for separate fields (title + description).
+  let qTitleVec = null, qDescVec = null, titleVecs = [], descVecs = [];
+  if (env.AI) {
+    try {
+      const qText = [...(intent.target_roles || []), ...(intent.related_roles || []).map((r) => r.role), ...(intent.skills || [])].join(" ");
+      const qVecs = await embedTexts(env, [qText.slice(0, 2000)]);
+      qTitleVec = qVecs[0];
+      qDescVec = qVecs[0];
+      titleVecs = await getFieldEmbeddings(env, jobs, "title", jobTitleText);
+      descVecs = await getFieldEmbeddings(env, jobs, "desc", jobDescText);
+    } catch (e) {
+      qTitleVec = null; qDescVec = null;
+    }
+  }
+
+  for (let i = 0; i < jobs.length; i++) {
+    const job = jobs[i];
+    const h = hybridScore(job, intent, titleVecs[i], descVecs[i], qTitleVec, qDescVec);
+    if (h === -1) continue; // excluded
+    if (h.base < MIN_RELEVANCE) continue;
+    result.push({ ...job, relevance: h.base, score: h.base * 100, breakdown: h });
+  }
+
+  // Preference rerank (capped, applied only after relevance).
+  const likeSet = new Set(likes || []);
+  const disSet = new Set(dislikes || []);
+  const likeCompanies = new Set(result.filter((j) => likeSet.has(j.url)).map((j) => normalizeCompanyName(j.company_name)).filter(Boolean));
+  const disCompanies = new Set(result.filter((j) => disSet.has(j.url)).map((j) => normalizeCompanyName(j.company_name)).filter(Boolean));
+
+  for (const j of result) {
+    const { bonus: locBonus, tier } = locationTier(intent, j);
+    j.location_tier = tier;
+    // Cap location influence to ±0.08 and feedback to ±0.04 on the 0-1 relevance scale.
+    let adj = Math.max(-0.08, Math.min(0.08, locBonus / 100));
+    if (likeSet.has(j.url)) adj += 0.04;
+    else if (likeCompanies.has(normalizeCompanyName(j.company_name))) adj += 0.02;
+    if (disSet.has(j.url)) adj -= 0.04;
+    else if (disCompanies.has(normalizeCompanyName(j.company_name))) adj -= 0.02;
+    j.score = Math.round((j.relevance + adj) * 100);
+    j.preference_adjustment = +adj.toFixed(4);
+  }
+
+  result.sort((a, b) => b.score - a.score);
+  return result;
+}
+__name(hybridRank, "hybridRank");
 async function handleLeads(request, env) {
   try {
     const body = await readJsonBody(request);
@@ -723,11 +745,16 @@ async function runDiscovery(id, query, env) {
     raw.failed = (raw.failed || []).concat(failed);
     raw.last_progress_at = Date.now();
     raw.status = "complete";
-    // Read back the accumulated jobs from the DB so the snapshot reflects everything.
+    // Read back the accumulated jobs from the DB and rank them through the same hybrid ranker.
     const dbJobs = await getAtsDb(env);
-    raw.jobs = dbJobs.filter((j) => companies.includes(normalizeCompanyName(j.company_name)) || companies.includes(j.company_name));
+    const scoped = dbJobs.filter((j) => companies.includes(normalizeCompanyName(j.company_name)) || companies.includes(j.company_name));
+    const intent = await parseQueryIntent(env, query);
+    const ranked = await hybridRank(env, intent, scoped, {});
+    raw.jobs = ranked;
+    raw.total_relevant = ranked.length;
+    raw.total_scoped = scoped.length;
     await env.JOBS_KV.put(`disc:${id}`, JSON.stringify(raw), { expirationTtl: 3600 });
-    console.log("[discovery] complete", id, raw.jobs.length, "failed:", failed.length);
+    console.log("[discovery] complete", id, raw.jobs.length, "of", scoped.length, "failed:", failed.length);
   } catch (err) {
     console.error("[discovery] background job failed:", err && err.message);
     try {
@@ -774,28 +801,9 @@ async function handleMatchProfile(request, env) {
     const limit = Math.min(Math.max(Number(body.limit) || 10, 1), 50);
     if (!profile) return jsonResponse({ error: "profile required" }, 400);
     const db = await getAtsDb(env);
-    const query = [
-      ...(profile.roles || []),
-      ...(profile.future_roles || []),
-      ...(profile.skills || []).slice(0, 10),
-      ...(profile.domains || []),
-      ...(profile.industries || [])
-    ].join(" ");
-    let scored;
-    if (env.AI) {
-      try { scored = await semanticRank(query, db, env); }
-      catch (e) { scored = keywordRank(query, db); }
-    } else {
-      scored = keywordRank(query, db);
-    }
-    // Tiered location preference (re-rank, not filter).
-    scored = scored.map((j) => {
-      const { bonus, tier } = locationTier(profile, j);
-      return { ...j, score: j.score + bonus, location_tier: tier };
-    }).sort((a, b) => b.score - a.score);
-    // Demote clearly irrelevant roles so preference bonuses don't rescue them.
-    scored = applyRelevanceGate(scored, query.split(/\s+/).filter(Boolean));
-    const jobs = scored.slice(0, limit).map((j) => ({
+    const intent = buildIntentFromProfile(profile);
+    const ranked = await hybridRank(env, intent, db, {});
+    const jobs = ranked.slice(0, limit).map((j) => ({
       job_id: j.job_posting_id || jobId(j.url),
       job_title: j.job_title,
       company_name: j.company_name,
@@ -809,6 +817,7 @@ async function handleMatchProfile(request, env) {
       is_active: j.is_active !== false,
       last_verified_at: j.last_verified_at || null,
       match_score: j.score,
+      relevance: +j.relevance.toFixed(3),
       match_reasons: matchReasons(j, profile),
       gaps: matchGaps(j, profile)
     }));
@@ -820,9 +829,17 @@ async function handleMatchProfile(request, env) {
 __name(handleMatchProfile, "handleMatchProfile");
 function matchReasons(job, profile) {
   const reasons = [];
+  if (job.breakdown) {
+    const b = job.breakdown;
+    if (b.roleFit >= 0.8) reasons.push("Strong role fit");
+    else if (b.roleFit >= 0.5) reasons.push("Partial role fit");
+    if (b.skillsFit >= 0.7) reasons.push("Skill overlap");
+    if (b.seniorityFit >= 0.9) reasons.push("Seniority match");
+    if (b.industryFit >= 0.9) reasons.push("Industry match");
+  }
   const hay = `${job.job_title || ""} ${job.description || ""}`.toLowerCase();
   for (const skill of (profile.skills || []).slice(0, 12)) {
-    if (skill && hay.includes(skill.toLowerCase())) reasons.push(`Matches skill: ${skill}`);
+    if (skill && hay.includes(skill.toLowerCase()) && reasons.length < 5) reasons.push(`Matches skill: ${skill}`);
   }
   const locs = [...(profile.preferred_locations || []), ...(profile.current_location ? [profile.current_location] : [])];
   for (const loc of locs) {
@@ -831,18 +848,20 @@ function matchReasons(job, profile) {
     const jl = `${job.job_location || ""} ${job.country || ""}`.toLowerCase();
     if (jl.includes(l)) reasons.push(`Location match: ${loc}`);
   }
-  if (job.job_seniority_level && profile.seniority &&
-      normalizeJobSeniority(job.job_seniority_level) === normalizeJobSeniority(profile.seniority)) {
-    reasons.push(`Seniority match: ${normalizeJobSeniority(profile.seniority)}`);
-  }
   return reasons.slice(0, 5);
 }
 __name(matchReasons, "matchReasons");
 function matchGaps(job, profile) {
   const gaps = [];
+  if (job.breakdown) {
+    const b = job.breakdown;
+    if (b.skillsFit < 0.5) gaps.push("Missing several required skills");
+    if (b.seniorityFit < 0.5) gaps.push("Seniority mismatch");
+    if (b.roleFit < 0.5) gaps.push("Role is outside your target family");
+  }
   const hay = `${job.job_title || ""} ${job.description || ""}`.toLowerCase();
   for (const skill of (profile.skills || []).slice(0, 12)) {
-    if (skill && !hay.includes(skill.toLowerCase())) gaps.push(`Job does not mention: ${skill}`);
+    if (skill && !hay.includes(skill.toLowerCase()) && gaps.length < 5) gaps.push(`Job does not mention: ${skill}`);
   }
   return gaps.slice(0, 5);
 }
@@ -1049,6 +1068,187 @@ function shortenReply(text) {
     .trim();
 }
 __name(shortenReply, "shortenReply");
+// ─── Query understanding + hybrid ranking ───
+function simpleHash(s) {
+  let h = 5381;
+  for (let i = 0; i < s.length; i++) h = ((h * 33) ^ s.charCodeAt(i)) >>> 0;
+  return h.toString(36);
+}
+__name(simpleHash, "simpleHash");
+function strArr(v) {
+  if (!Array.isArray(v)) return [];
+  return v.map((x) => (x && typeof x === "object" && x.name != null ? x.name : String(x == null ? "" : x))).map((x) => x.trim()).filter(Boolean);
+}
+__name(strArr, "strArr");
+// Parse a natural-language query into structured intent, cached in KV.
+async function parseQueryIntent(env, query) {
+  const key = "intent:" + simpleHash(query);
+  const cached = await env.JOBS_KV.get(key, { type: "json" });
+  if (cached) return cached;
+  const system = `You parse a job search query into structured intent. Return ONLY JSON, no markdown, with these keys:
+- "target_roles": array of the 1-3 main job titles the user is looking for.
+- "related_roles": array of up to 8 objects {"role": string, "weight": number 0-1} for adjacent roles they would also accept (e.g. "Creative Technologist" -> "Design Technologist" 1.0, "Creative Developer" 0.95).
+- "skills": array of skills/tools mentioned or strongly implied.
+- "must_have": array of hard requirements.
+- "exclude": array of things to avoid (e.g. "sales", "recruiting").
+- "seniority": array of seniority levels from ["intern","entry","associate","mid","senior","lead","manager","director","executive"].
+- "preferred_locations": array of locations.
+- "remote_preference": one of "remote","hybrid","onsite", or null.`;
+  let intent;
+  try {
+    const raw = await llmChat(env, system, `Query: ${query}`, 700);
+    const p = parseChatJson(raw);
+    intent = {
+      target_roles: strArr(p.target_roles),
+      related_roles: Array.isArray(p.related_roles)
+        ? p.related_roles.filter((r) => r && r.role).map((r) => ({ role: String(r.role).trim(), weight: Math.min(1, Math.max(0, Number(r.weight) || 0.9)) }))
+        : [],
+      skills: strArr(p.skills),
+      must_have: strArr(p.must_have),
+      exclude: strArr(p.exclude),
+      seniority: strArr(p.seniority),
+      preferred_locations: strArr(p.preferred_locations),
+      remote_preference: p.remote_preference ? String(p.remote_preference).toLowerCase() : null
+    };
+  } catch (e) {
+    intent = { target_roles: [query], related_roles: [], skills: [], must_have: [], exclude: [], seniority: [], preferred_locations: [], remote_preference: null };
+  }
+  await env.JOBS_KV.put(key, JSON.stringify(intent), { expirationTtl: 3600 });
+  return intent;
+}
+__name(parseQueryIntent, "parseQueryIntent");
+// Build intent from an already-structured profile (no LLM needed).
+function buildIntentFromProfile(profile) {
+  const related = (profile.future_roles || []).map((r, i) => ({ role: r, weight: Math.max(0.5, 1 - i * 0.05) }));
+  return {
+    target_roles: (profile.roles || []).slice(0, 3),
+    related_roles: related.slice(0, 8),
+    skills: (profile.skills || []).slice(0, 20),
+    must_have: [],
+    exclude: [],
+    seniority: profile.seniority ? [profile.seniority] : [],
+    preferred_locations: profile.preferred_locations || [],
+    current_location: profile.current_location || null,
+    remote_preference: profile.remote_preference || null,
+    willing_to_relocate: !!profile.willing_to_relocate
+  };
+}
+__name(buildIntentFromProfile, "buildIntentFromProfile");
+// Per-field job text for separate embeddings.
+function jobTitleText(j) { return j.job_title || ""; }
+__name(jobTitleText, "jobTitleText");
+function jobDescText(j) { return String(j.description || "").slice(0, 1200); }
+__name(jobDescText, "jobDescText");
+// Generic field-embedding cache (title and description are embedded separately).
+async function getFieldEmbeddings(env, jobs, field, textFn) {
+  const meta = await env.JOBS_KV.get(`job_${field}_meta`, { type: "json" });
+  if (meta && meta.count === jobs.length && meta.dim > 0 && meta.version === EMBED_VERSION) {
+    const buf = await env.JOBS_KV.get(`job_${field}`, { type: "arrayBuffer" });
+    if (buf) {
+      const flat = new Float32Array(buf);
+      const dim = meta.dim;
+      const vecs = [];
+      for (let i = 0; i < jobs.length; i++) vecs.push(Array.from(flat.slice(i * dim, (i + 1) * dim)));
+      return vecs;
+    }
+  }
+  const texts = jobs.map(textFn);
+  const vecs = await embedTexts(env, texts);
+  const dim = vecs[0] ? vecs[0].length : 0;
+  const flat = new Float32Array(vecs.length * dim);
+  for (let i = 0; i < vecs.length; i++) for (let k = 0; k < dim; k++) flat[i * dim + k] = vecs[i][k];
+  await env.JOBS_KV.put(`job_${field}`, flat.buffer);
+  await env.JOBS_KV.put(`job_${field}_meta`, JSON.stringify({ count: vecs.length, dim, version: EMBED_VERSION }));
+  return vecs;
+}
+__name(getFieldEmbeddings, "getFieldEmbeddings");
+// Hybrid relevance: role/title similarity, skills, responsibilities, seniority, industry, freshness.
+function hybridScore(job, intent, titleVec, descVec, qTitleVec, qDescVec) {
+  const titleCos = qTitleVec ? cosineSimilarity(qTitleVec, titleVec) : 0;
+  const descCos = qDescVec ? cosineSimilarity(qDescVec, descVec) : 0;
+  const t = (job.job_title || "").toLowerCase();
+  const d = (job.description || "").toLowerCase().slice(0, 1500);
+
+  // Role/title fit (weighted role expansion). Lexical first; embedding only as a weak
+  // supplementary signal, never a full fallback (embeddings cluster similar-sounding titles).
+  let roleFit = 0;
+  const roleWords = (r) => r.toLowerCase().split(/[^a-z0-9+#]+/).filter((w) => w.length > 2);
+  for (const r of intent.target_roles || []) {
+    const rl = r.toLowerCase();
+    if (t.includes(rl)) { roleFit = Math.max(roleFit, 1); }
+    else {
+      const words = roleWords(r);
+      if (words.length && words.every((w) => t.includes(w))) roleFit = Math.max(roleFit, 0.8);
+      else if (words.some((w) => t.includes(w))) roleFit = Math.max(roleFit, 0.5);
+    }
+  }
+  for (const rr of intent.related_roles || []) {
+    const rl = rr.role.toLowerCase();
+    if (t.includes(rl)) roleFit = Math.max(roleFit, rr.weight * 0.95);
+    else {
+      const words = roleWords(rr.role);
+      if (words.length && words.every((w) => t.includes(w))) roleFit = Math.max(roleFit, rr.weight * 0.75);
+      else if (words.some((w) => t.includes(w))) roleFit = Math.max(roleFit, rr.weight * 0.45);
+    }
+  }
+  // Weak supplementary: title embedding similarity, capped and discounted.
+  if (roleFit < 0.4) roleFit = Math.max(roleFit, titleCos * 0.5);
+
+  // Skills fit.
+  let skillsFit = 0;
+  const skills = intent.skills || [];
+  if (skills.length) {
+    let hit = 0;
+    for (const s of skills) {
+      const sl = s.toLowerCase();
+      if (t.includes(sl) || d.includes(sl)) hit++;
+    }
+    skillsFit = hit / skills.length;
+  } else {
+    skillsFit = descCos;
+  }
+
+  // Responsibilities similarity (description embedding).
+  const respFit = descCos;
+
+  // Seniority compatibility.
+  let seniorityFit = 0.5;
+  if (intent.seniority && intent.seniority.length) {
+    const js = job.job_seniority || "unknown";
+    const matches = intent.seniority.some((s) => canonicalSeniority(s) === js);
+    seniorityFit = matches ? 1 : 0.2;
+  }
+
+  // Industry/domain fit (lexical only, cheap).
+  let industryFit = 0.5;
+  const ind = `${job.job_industries || ""} ${job.job_function || ""}`.toLowerCase();
+  if (ind && (intent.skills || []).length) {
+    const overlap = (intent.skills || []).filter((s) => ind.includes(s.toLowerCase())).length;
+    industryFit = overlap ? 1 : 0.4;
+  }
+
+  // Freshness.
+  let freshness = 0.5;
+  if (job.job_posted_date) {
+    const days = (Date.now() - new Date(job.job_posted_date).getTime()) / 86400000;
+    freshness = days <= 7 ? 1 : days <= 30 ? 0.7 : days <= 90 ? 0.4 : 0.2;
+  }
+
+  // Exclusions.
+  const exclude = (intent.exclude || []).map((x) => x.toLowerCase());
+  if (exclude.some((x) => t.includes(x) || d.includes(x))) return -1;
+
+  const base =
+    roleFit * 0.35 +
+    skillsFit * 0.25 +
+    respFit * 0.20 +
+    seniorityFit * 0.10 +
+    industryFit * 0.05 +
+    freshness * 0.05;
+
+  return { base, roleFit, skillsFit, respFit, seniorityFit, industryFit, freshness };
+}
+__name(hybridScore, "hybridScore");
 async function collectAtsJobs(companies, env) {
   const all = [];
   const CONCURRENCY = 8;
