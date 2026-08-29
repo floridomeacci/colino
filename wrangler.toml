@@ -1,0 +1,19 @@
+name = "jobs-dashboard"
+main = "src/worker.js"
+compatibility_date = "2024-09-23"
+
+[ai]
+binding = "AI"
+
+[assets]
+directory = "./public"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
+
+[[kv_namespaces]]
+binding = "JOBS_KV"
+id = "974bea3f3c544003b8941c9cdad18815"
+
+[[routes]]
+pattern = "colino.work"
+custom_domain = true

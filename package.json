@@ -1,0 +1,22 @@
+{
+  "name": "jobs.dashboard",
+  "version": "1.0.0",
+  "description": "Cloudflare Workers job dashboard",
+  "main": "src/worker.js",
+  "scripts": {
+    "dev": "wrangler dev --env-file .env",
+    "deploy": "wrangler deploy",
+    "collect": "node collectors/index.mjs"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "devDependencies": {
+    "wrangler": "^4.125.0"
+  },
+  "allowScripts": {
+    "esbuild@0.28.1": true,
+    "workerd@1.20260820.1": true
+  }
+}

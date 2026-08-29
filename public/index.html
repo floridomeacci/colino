@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Colino: job search that filters to your CV</title>
+  <meta name="description" content="Colino strains live jobs across every sector down to the ones that fit. Upload your CV and get matched by skills, seniority, and location.">
+  <meta name="robots" content="index, follow">
+  <meta name="author" content="Florido Meacci">
+  <link rel="canonical" href="https://colino.work/">
+
+  <!-- Open Graph -->
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="Colino">
+  <meta property="og:url" content="https://colino.work/">
+  <meta property="og:title" content="Colino: job search that filters to your CV">
+  <meta property="og:description" content="Strain out the noise. Colino filters live jobs across every sector down to the ones that fit your CV, matched by skills, seniority, and location.">
+  <meta property="og:image" content="https://colino.work/og-image.png">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta property="og:locale" content="en_US">
+
+  <!-- Twitter Card -->
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="Colino: job search that filters to your CV">
+  <meta name="twitter:description" content="Strain out the noise. Colino filters live jobs across every sector down to the ones that fit your CV.">
+  <meta name="twitter:image" content="https://colino.work/og-image.png">
+
+  <!-- Structured data -->
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "WebSite",
+    "name": "Colino",
+    "url": "https://colino.work/",
+    "description": "Job search that filters live openings down to the ones that fit your CV.",
+    "inLanguage": "en",
+    "author": {
+      "@type": "Person",
+      "name": "Florido Meacci",
+      "url": "https://floridomeacci.xyz"
+    }
+  }
+  </script>
+
+  <link rel="icon" type="image/svg+xml" href="favicon.svg">
+  <link rel="icon" type="image/png" sizes="192x192" href="favicon-192.png">
+  <link rel="apple-touch-icon" href="apple-touch-icon.png">
+
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Serif+Display&family=DM+Sans:ital,opsz,wght@0,9..40,300..700;1,9..40,300..700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css?v=26">
+</head>
+<body>
+  <div class="app">
+    <!-- Sidebar: chat + notes -->
+    <aside class="sidebar" id="sidebar">
+      <div class="sidebar-head">
+        <span class="sidebar-title">Agent</span>
+        <button class="side-section-action" id="clearChat" title="Clear chat">Clear</button>
+        <button class="sidebar-toggle" id="sidebarToggle" aria-label="Toggle sidebar">&lsaquo;</button>
+      </div>
+
+      <div class="sidebar-body">
+        <section class="side-section chat-section">
+          <div class="chat-messages" id="chatMessages">
+            <div class="chat-welcome" id="chatWelcome">
+              <p class="chat-welcome-title">Find work that fits you</p>
+              <p class="chat-welcome-sub">Upload your resume or just tell me what you're looking for.</p>              <div class="chat-welcome-actions">
+                <button class="welcome-btn welcome-btn-primary" id="welcomeUpload">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+                  Upload resume
+                </button>
+              </div>
+              <button class="welcome-hint" data-prompt="Show me creative jobs">
+                Not sure? Try “show me creative jobs”
+              </button>
+            </div>
+          </div>
+          <form class="chat-input-row" id="chatForm">
+            <textarea id="chatInput" class="chat-input" placeholder="Describe what you're looking for…" rows="3" autocomplete="off"></textarea>
+            <div class="chat-actions">
+              <label class="chat-attach" id="chatAttach" title="Upload resume">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+                <input type="file" id="chatFileInput" accept=".pdf" hidden>
+              </label>
+              <button type="submit" class="chat-send" id="chatSend" aria-label="Send">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+              </button>
+            </div>
+          </form>
+        </section>
+      </div>
+    </aside>
+
+    <!-- Main -->
+    <div class="main">
+    <div class="page">
+    <!-- Masthead -->
+    <header class="masthead">
+      <div class="masthead-inner">
+        <div class="masthead-brand">
+          <h1 class="masthead-title">Colino</h1>
+        </div>
+        <p class="masthead-tagline">Strain out the noise. Find the jobs that fit.</p>
+      </div>
+    </header>
+
+    <!-- SEO / intro -->
+    <section class="intro" aria-label="About Colino">
+      <p class="intro-lede">Colino is a job search that filters live openings across every sector down to the roles that actually match your CV. Upload your resume and Colino reads your skills, roles, seniority, and location, then ranks the jobs that fit and tells you which companies to look at next.</p>
+    </section>
+
+    <!-- Ticker stats -->
+    <div class="ticker">
+      <div class="ticker-inner">
+        <span class="ticker-item"><b id="statTotal">…</b> positions</span>
+        <span class="ticker-sep">/</span>
+        <span class="ticker-item"><b id="statCompanies">…</b> companies</span>
+      </div>
+    </div>
+
+    <!-- Controls -->
+    <section class="controls">
+      <div class="search-wrap">
+        <svg class="search-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="8.5" cy="8.5" r="5.5"/><line x1="12.5" y1="12.5" x2="18" y2="18"/></svg>
+        <input type="text" id="searchInput" placeholder="Search roles, companies, skills, city, country…" autocomplete="off">
+      </div>
+      <div class="filter-row">
+        <select id="seniorityFilter"><option value="">Seniority</option></select>
+        <select id="employmentFilter"><option value="">Type</option></select>
+        <select id="easyApplyFilter">
+          <option value="">Easy Apply</option>
+          <option value="yes">Yes</option>
+          <option value="no">No</option>
+        </select>
+        <select id="newFilter">
+          <option value="">New</option>
+          <option value="new">New only</option>
+          <option value="old">Older</option>
+        </select>
+        <select id="salaryFilter">
+          <option value="">Salary</option>
+          <option value="with">With salary</option>
+          <option value="without">Without salary</option>
+        </select>
+        <select id="sortBy">
+          <option value="recent">Recent first</option>
+          <option value="favorites">▲ Liked</option>
+          <option value="applicants-asc">Fewest applicants</option>
+          <option value="applicants-desc">Most applicants</option>
+          <option value="salary-desc">Highest salary</option>
+          <option value="salary-asc">Lowest salary</option>
+          <option value="title-asc">A → Z</option>
+        </select>
+      </div>
+      <div class="tag-row" id="tagRow"></div>
+    </section>
+
+    <!-- Job feed -->
+    <section id="jobFeed" class="feed">
+      <div class="loader" id="loader">
+        <div class="loader-bar"></div>
+        <p>Loading positions…</p>
+      </div>
+    </section>
+
+    <footer class="feed-footer" id="feedFooter"></footer>
+    <nav class="pagination" id="pagination"></nav>
+
+    <footer class="site-footer">
+      <span>Built by <a href="https://floridomeacci.xyz" target="_blank" rel="noopener noreferrer">Florido Meacci</a></span>
+      <span class="footer-sep">&middot;</span>
+      <a href="https://buymeacoffee.com/floridomeacci" target="_blank" rel="noopener noreferrer">Buy me a coffee ☕</a>
+    </footer>
+    </div>
+    </div>
+  </div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+  <script src="webmcp.js?v=4"></script>
+  <script src="app.js?v=63"></script>
+</body>
+</html>
