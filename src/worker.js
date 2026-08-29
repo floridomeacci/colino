@@ -83,11 +83,17 @@ __name(handleGetJobs, "handleGetJobs");
 async function handleGetStats(env) {
   const jobs = await getAtsDb(env);
   const companies = new Set(jobs.map((j) => j.company_name).filter(Boolean));
+  const seniority = {};
+  for (const j of jobs) {
+    const s = j.job_seniority || "unknown";
+    seniority[s] = (seniority[s] || 0) + 1;
+  }
   return jsonResponse({
-    total: jobs.length,
+    total_jobs: jobs.length,
     companies: companies.size,
-    easyApply: jobs.filter((j) => j.is_easy_apply).length,
-    avgApplicants: 0
+    easy_apply: jobs.filter((j) => j.is_easy_apply).length,
+    seniority,
+    database_updated_at: jobs.length ? new Date(Math.max(...jobs.map((j) => j.collected_at || 0))).toISOString() : null
   });
 }
 __name(handleGetStats, "handleGetStats");
@@ -655,10 +661,13 @@ async function handleMatchProfile(request, env) {
       company_name: j.company_name,
       job_location: j.job_location,
       country: j.country,
-      job_seniority_level: j.job_seniority_level,
+      seniority: j.job_seniority || "unknown",
+      seniority_raw: j.seniority_raw || null,
       job_employment_type: j.job_employment_type,
       url: j.url,
       posted_at: j.job_posted_date,
+      is_active: j.is_active !== false,
+      last_verified_at: j.last_verified_at || null,
       match_score: j.score,
       match_reasons: matchReasons(j, profile),
       gaps: matchGaps(j, profile)
@@ -894,7 +903,15 @@ async function getAtsDb(env) {
       if (!j.collected_at || j.collected_at >= cutoff) {
         if (!j.country) j.country = inferCountry(j.job_location);
         if (!j.company_logo) j.company_logo = logoFromJob(j);
-        if (j.job_seniority_level) j.job_seniority_level = normalizeJobSeniority(j.job_seniority_level);
+        if (j.job_seniority_level) {
+          j.seniority_raw = j.job_seniority_level;
+          j.job_seniority_level = normalizeJobSeniority(j.job_seniority_level);
+          j.job_seniority = canonicalSeniority(j.seniority_raw);
+        } else {
+          j.job_seniority = "unknown";
+        }
+        j.last_verified_at = j.collected_at ? new Date(j.collected_at).toISOString() : null;
+        j.is_active = !!j.collected_at && j.collected_at >= cutoff;
         j.company_name = normalizeCompanyName(j.company_name);
         all.push(j);
       }
@@ -1023,6 +1040,22 @@ function inferCountry(location) {
   return null;
 }
 __name(inferCountry, "inferCountry");
+function canonicalSeniority(raw) {
+  if (!raw) return "unknown";
+  const s = String(raw).toLowerCase().trim();
+  if (!s || s === "not applicable" || s === "unknown") return "unknown";
+  if (s.includes("intern") || s.includes("student") || s.includes("trainee")) return "intern";
+  if (/^(p[12]|ic[1-3])\b/.test(s) || s.includes("entry") || s.includes("junior") || s.includes("graduate")) return "entry";
+  if (s.includes("associate") || /^ic4\b/.test(s)) return "associate";
+  if (s.includes("mid") || /^(p3|ic5)\b/.test(s)) return "mid";
+  if (s.includes("senior") || /^(p[45]|ic[6-9]|ic1[0-9])\b/.test(s) || s.includes("experienced")) return "senior";
+  if (s.includes("lead") || s.includes("staff") || s.includes("principal") || /^p[6-9]\b/.test(s) || /^p1[0-9]\b/.test(s)) return "lead";
+  if (/^m[1-3]\b/.test(s) || (s.includes("manager") && !s.includes("senior manager") && !s.includes("director"))) return "manager";
+  if (/^m[4-9]\b/.test(s) || s.includes("senior manager") || s.includes("director") || s.includes("head")) return "director";
+  if (s.includes("executive") || s.includes("vp") || s.includes("chief") || s.includes("c-level")) return "executive";
+  return "unknown";
+}
+__name(canonicalSeniority, "canonicalSeniority");
 function normalizeJobSeniority(raw) {
   if (!raw) return null;
   const s = String(raw).trim();

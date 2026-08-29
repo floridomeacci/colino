@@ -65,12 +65,14 @@
       company_name: j.company_name,
       job_location: j.job_location,
       country: j.country,
-      job_seniority_level: j.job_seniority_level,
+      seniority: j.job_seniority || "unknown",
+      seniority_raw: j.seniority_raw || null,
       job_employment_type: j.job_employment_type,
       workplace_type: j.workplace_type,
       source_url: j.url,
       posted_at: j.job_posted_date || null,
-      posted_time: j.job_posted_time || null
+      is_active: j.is_active !== false,
+      last_verified_at: j.last_verified_at || null
     };
   }
 
@@ -123,7 +125,7 @@
         // Structured filters (post-filtering since /api/search is semantic).
         if (Array.isArray(input.seniority) && input.seniority.length) {
           const want = input.seniority.map((s) => String(s).toLowerCase());
-          jobs = jobs.filter((j) => want.includes(String(j.job_seniority_level || "").toLowerCase()));
+          jobs = jobs.filter((j) => want.includes(String(j.job_seniority || "unknown").toLowerCase()));
         }
         if (Array.isArray(input.employment_types) && input.employment_types.length) {
           const want = input.employment_types.map((s) => String(s).toLowerCase());
@@ -270,10 +272,11 @@
         const companies = new Set(jobs.map((j) => j.company_name).filter(Boolean));
         const seniority = {};
         for (const j of jobs) {
-          const s = j.job_seniority_level || "Unknown";
+          const s = j.job_seniority || "unknown";
           seniority[s] = (seniority[s] || 0) + 1;
         }
-        return ok({ total_jobs: jobs.length, companies: companies.size, seniority });
+        const dbUpdated = jobs.length ? new Date(Math.max(...jobs.map((j) => j.collected_at || 0))).toISOString() : null;
+        return ok({ total_jobs: jobs.length, companies: companies.size, seniority, database_updated_at: dbUpdated });
       })
   );
 
@@ -416,6 +419,75 @@
           companies_total: res.companies_total,
           jobs
         });
+      })
+  );
+  // ── Saved jobs (session-scoped, localStorage) ──
+  function savedIds() {
+    try { return new Set(JSON.parse(localStorage.getItem("colino_saved") || "[]")); } catch (e) { return new Set(); }
+  }
+  function saveIds(set) {
+    try { localStorage.setItem("colino_saved", JSON.stringify([...set])); } catch (e) {}
+  }
+
+  register(
+    "save-job",
+    "Save job",
+    "Save a job to the current session's shortlist by its job_id.",
+    {
+      type: "object",
+      properties: {
+        job_id: { type: "string", minLength: 1, description: "The job_id to save." }
+      },
+      required: ["job_id"]
+    },
+    async (input) =>
+      safe(async () => {
+        const id = clean(input.job_id, 200);
+        if (!id) return fail("INVALID_INPUT", "job_id is required");
+        const jobs = await API("/api/jobs");
+        if (!jobs.some((j) => j.job_posting_id === id)) return fail("JOB_NOT_FOUND", "No job matched that job_id.");
+        const s = savedIds();
+        s.add(id);
+        saveIds(s);
+        return ok({ job_id: id, saved: true, saved_count: s.size });
+      })
+  );
+
+  register(
+    "unsave-job",
+    "Unsave job",
+    "Remove a job from the current session's shortlist by its job_id.",
+    {
+      type: "object",
+      properties: {
+        job_id: { type: "string", minLength: 1, description: "The job_id to remove." }
+      },
+      required: ["job_id"]
+    },
+    async (input) =>
+      safe(async () => {
+        const id = clean(input.job_id, 200);
+        if (!id) return fail("INVALID_INPUT", "job_id is required");
+        const s = savedIds();
+        s.delete(id);
+        saveIds(s);
+        return ok({ job_id: id, saved: false, saved_count: s.size });
+      })
+  );
+
+  register(
+    "list-saved-jobs",
+    "Saved jobs",
+    "List the jobs saved in the current session, in the order they were saved.",
+    { type: "object", properties: {} },
+    async () =>
+      safe(async () => {
+        const ids = [...savedIds()];
+        if (!ids.length) return ok({ jobs: [], saved_count: 0 });
+        const jobs = await API("/api/jobs");
+        const byId = new Map(jobs.map((j) => [j.job_posting_id, j]));
+        const out = ids.map((id) => byId.get(id)).filter(Boolean).map(summary);
+        return ok({ jobs: out, saved_count: out.length });
       })
   );
 })();
