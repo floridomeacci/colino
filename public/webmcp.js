@@ -69,6 +69,7 @@
   }
 
   function summary(j) {
+    const r = j.rerank || null;
     return {
       job_id: jobId(j),
       job_title: j.job_title,
@@ -82,7 +83,17 @@
       source_url: j.url,
       posted_at: j.job_posted_date || null,
       is_active: j.is_active !== false,
-      last_verified_at: j.last_verified_at || null
+      last_verified_at: j.last_verified_at || null,
+      remote_regions: j.remote_regions || null,
+      canonical_country: j.canonical_country || null,
+      _dup_count: j._dup_count || null,
+      role_fit: r ? r.role_fit : null,
+      skills_fit: r ? r.skills_fit : null,
+      seniority_fit: r ? r.seniority_fit : null,
+      location_fit: r ? r.location_fit : null,
+      overall: r ? r.overall : null,
+      reasons: r ? (r.reasons || []) : null,
+      gaps: r ? (r.gaps || []) : null
     };
   }
 
@@ -193,8 +204,9 @@
           next_cursor: offset + limit < matched ? offset + limit : null,
           database_total: res.total ?? matched,
           search_mode: res.search_mode || null,
+          rerank_status: res.rerank_status || null,
           jobs: page.map(summary)
-        }, { search_mode: res.search_mode || null });
+        }, { search_mode: res.search_mode || null, ...(res.meta || {}) });
       })
   );
 

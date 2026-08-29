@@ -134,7 +134,7 @@ async function handleGetJob(request, env) {
     const jobs = await getAtsDb(env);
     const job = jobs.find((j) => (jobId_ && j.job_posting_id === jobId_) || (url && j.url === url));
     if (!job) return jsonResponse({ error: "Job not found" }, 404);
-    return jsonResponse(job);
+    return jsonResponse(enrichJob({ ...job }));
   } catch (err) {
     return jsonResponse({ error: err && err.message ? err.message : String(err) }, err.status || 500);
   }
@@ -496,11 +496,15 @@ async function handleSearch(request, env) {
     const db = await getAtsDb(env);
     const query = tags.join(" ");
     const intent = await parseQueryIntent(env, query);
-    const ranked = await hybridRank(env, intent, db, { likes, dislikes });
+    const rerank = body.rerank !== false;
+    const opts = { likes, dislikes, rerank };
+    const ranked = await hybridRank(env, intent, db, opts);
     return jsonResponse({
       jobs: ranked.slice(0, 500),
       total: ranked.length,
       search_mode: "hybrid",
+      rerank_status: opts.meta ? opts.meta.rerank_status : null,
+      meta: opts.meta || null,
       intent: { target_roles: intent.target_roles, related_roles: intent.related_roles, exclude: intent.exclude }
     });
   } catch (err) {
@@ -668,8 +672,11 @@ async function hybridRank(env, intent, jobs, opts = {}) {
 
   // Second-stage LLM rerank of the top candidates (structured fit + reasons).
   if (rerank && result.length > 1) {
-    return rerankWithLLM(env, intent, result);
+    const out = await rerankWithLLM(env, intent, result);
+    opts.meta = out.meta;
+    return out.jobs;
   }
+  opts.meta = { rerank_status: "skipped", rerank_model: llmModelName(env), candidates_reranked: 0 };
   return result;
 }
 __name(hybridRank, "hybridRank");
@@ -700,7 +707,7 @@ function dedupJobs(jobs, intent) {
     let bestTier = 99;
     for (const it of items) {
       const { tier } = locationTier(intent, it);
-      const rank = { exact_city: 0, compatible_remote: 1, country: 2, region: 2, unknown: 3, relocate: 3, incompatible: 4 }[tier] ?? 3;
+      const rank = { exact_city: 0, compatible_remote: 1, country: 2, region: 2, unknown: 3, relocate: 3, incompatible: 4, region_mismatch: 5 }[tier] ?? 3;
       if (rank < bestTier) { bestTier = rank; best = it; }
     }
     merged.job_location = best.job_location;
@@ -712,13 +719,19 @@ function dedupJobs(jobs, intent) {
 }
 __name(dedupJobs, "dedupJobs");
 // ─── Second-stage cross-encoder reranker ───
+function llmModelName(env) {
+  return env.DEEPSEEK_API_KEY ? "deepseek-chat" : "deepseek-v3 (replicate)";
+}
+__name(llmModelName, "llmModelName");
 async function rerankWithLLM(env, intent, candidates) {
   const top = candidates.slice(0, 30);
-  if (!top.length) return candidates;
-  const rows = top.map((j, i) => `${i} | ${j.job_title} | ${j.company_name} | ${j.job_location || ""} | ${j.job_seniority || "unknown"}`).join("\n");
+  const meta = { rerank_status: "skipped", rerank_model: llmModelName(env), candidates_reranked: 0 };
+  if (!top.length) return { jobs: candidates, meta };
+  const rows = top.map((j, i) => `${i} | ${j.job_title} | ${j.company_name} | ${j.job_location || ""} | ${j.job_seniority || "unknown"} | tier=${j.location_tier || "unknown"}`).join("\n");
   const system = `You are a job relevance reranker. Given a candidate's structured intent and a list of jobs, score each job's fit. Return ONLY a JSON object, no markdown, shaped as:
 {"results":[{"idx":0,"role_fit":0.88,"skills_fit":0.81,"seniority_fit":0.72,"location_fit":1,"overall":0.84,"reasons":["..."],"gaps":["..."]}]}
-Score 0-1. "idx" must match the numeric index in the job list. Keep reasons and gaps short (max 3 each).`;
+Score 0-1. "idx" must match the numeric index in the job list. Keep reasons and gaps short (max 3 each).
+Location rules: each row ends with a precomputed "tier". exact_city and compatible_remote mean the location matches the candidate's preference (location_fit should be high). country/region/relocate are partial. region_mismatch and incompatible mean the location does NOT match (location_fit must be low). Do not override an explicit region preference (e.g. "remote eu" must not treat a UK/US on-site or remote job as a location match).`;
   const prompt = `Intent:\n${JSON.stringify({ target_roles: intent.target_roles, related_roles: intent.related_roles, skills: intent.skills, seniority: intent.seniority, preferred_locations: intent.preferred_locations, exclude: intent.exclude })}\n\nJobs:\n${rows}`;
   let parsed;
   try {
@@ -727,7 +740,10 @@ Score 0-1. "idx" must match the numeric index in the job list. Keep reasons and 
   } catch (e) {
     parsed = null;
   }
-  if (!parsed || !Array.isArray(parsed.results)) return candidates;
+  if (!parsed || !Array.isArray(parsed.results)) {
+    meta.rerank_status = "failed";
+    return { jobs: candidates, meta };
+  }
   const byIdx = new Map(parsed.results.map((r) => [Number(r.idx), r]));
   for (let i = 0; i < candidates.length; i++) {
     const r = byIdx.get(i);
@@ -736,11 +752,16 @@ Score 0-1. "idx" must match the numeric index in the job list. Keep reasons and 
         role_fit: r.role_fit, skills_fit: r.skills_fit, seniority_fit: r.seniority_fit,
         location_fit: r.location_fit, overall: r.overall, reasons: r.reasons || [], gaps: r.gaps || []
       };
-      candidates[i].score = Math.round((r.overall ?? candidates[i].relevance) * 100);
+      // Preserve the pre-computed preference adjustment (location tier + feedback)
+      // so the region/eligibility signal is never lost to the LLM's own estimate.
+      const adj = candidates[i].preference_adjustment || 0;
+      candidates[i].score = Math.round(((r.overall ?? candidates[i].relevance) + adj) * 100);
     }
   }
   candidates.sort((a, b) => b.score - a.score);
-  return candidates;
+  meta.rerank_status = "completed";
+  meta.candidates_reranked = parsed.results.length;
+  return { jobs: candidates, meta };
 }
 __name(rerankWithLLM, "rerankWithLLM");
 // ─── Job-data enrichment (remote regions, work authorization, canonical location) ───
@@ -749,6 +770,7 @@ function enrichJob(j) {
   const country = String(j.country || "").toLowerCase();
   const isRemote = /remote/i.test(loc) || /remote/i.test(j.workplace_type || "");
   j.workplace_type = j.workplace_type || (isRemote ? "Remote" : null);
+  j.remote_regions = null;
   if (isRemote) {
     // Detect remote geographic restrictions from the location text.
     j.remote_regions = [];
@@ -763,11 +785,13 @@ function enrichJob(j) {
     }
     if (!j.remote_regions.length) j.remote_regions = ["Global"];
   }
-  // Canonical city/country.
+  // Canonical country (always emitted, may be null when unresolvable).
   if (country) j.canonical_country = country;
   else if (loc) {
     const guess = inferCountry(j.job_location);
-    if (guess) j.canonical_country = guess.toLowerCase();
+    j.canonical_country = guess ? guess.toLowerCase() : null;
+  } else {
+    j.canonical_country = null;
   }
   j.is_active = j.is_active !== false;
   return j;
@@ -1195,7 +1219,7 @@ function strArr(v) {
 __name(strArr, "strArr");
 // Parse a natural-language query into structured intent, cached in KV.
 async function parseQueryIntent(env, query) {
-  const key = "intent:" + simpleHash(query);
+  const key = "intent:v2:" + simpleHash(query);
   const cached = await env.JOBS_KV.get(key, { type: "json" });
   if (cached) return cached;
   const system = `You parse a job search query into structured intent. Return ONLY JSON, no markdown, with these keys:
@@ -1204,7 +1228,7 @@ async function parseQueryIntent(env, query) {
 - "skills": array of skills/tools mentioned or strongly implied.
 - "must_have": array of hard requirements.
 - "exclude": array of things to avoid (e.g. "sales", "recruiting").
-- "seniority": array of seniority levels from ["intern","entry","associate","mid","senior","lead","manager","director","executive"].
+- "seniority": array of seniority levels from ["intern","entry","junior","associate","mid","senior","lead","staff","manager","director","executive"]. Map "junior" to "entry" and "staff"/"principal" to "lead" only if no better match.
 - "preferred_locations": array of locations.
 - "remote_preference": one of "remote","hybrid","onsite", or null.`;
   let intent;
@@ -1226,6 +1250,20 @@ async function parseQueryIntent(env, query) {
   } catch (e) {
     intent = { target_roles: [query], related_roles: [], skills: [], must_have: [], exclude: [], seniority: [], preferred_locations: [], remote_preference: null };
   }
+  // Deterministic recovery of remote/region tokens. The LLM reliably drops
+  // "remote eu" / "emea" style location hints, so merge them from the raw text.
+  const qLow = ` ${query.toLowerCase()} `;
+  if (/\bremote\b/.test(qLow)) intent.remote_preference = intent.remote_preference || "remote";
+  const prefs = new Set((intent.preferred_locations || []).map((s) => s.toLowerCase()));
+  const mRemote = qLow.match(/\bremote\s+(eu|emea|europe|uk|us|usa|united states|united kingdom|apac|asia|worldwide|anywhere|global)\b/);
+  if (mRemote) {
+    const reg = regionFor(mRemote[1]);
+    prefs.add(reg ? `remote ${reg}` : mRemote[1]);
+  }
+  for (const kw of ["emea", "europe", "apac", "worldwide", "asia pacific"]) {
+    if (qLow.includes(kw)) prefs.add(kw);
+  }
+  intent.preferred_locations = [...prefs];
   await env.JOBS_KV.put(key, JSON.stringify(intent), { expirationTtl: 3600 });
   return intent;
 }
@@ -1324,12 +1362,29 @@ function hybridScore(job, intent, titleVec, descVec, qTitleVec, qDescVec) {
   // Responsibilities similarity (description embedding).
   const respFit = descCos;
 
-  // Seniority compatibility.
+  // Seniority compatibility. Explicit intent acts as a strong eligibility signal:
+  // a 2+ rank gap (e.g. "junior" vs "staff") must demote hard, not just nudge.
   let seniorityFit = 0.5;
+  let seniorityGap = 0;
+  let explicitSeniority = false;
   if (intent.seniority && intent.seniority.length) {
-    const js = job.job_seniority || "unknown";
-    const matches = intent.seniority.some((s) => canonicalSeniority(s) === js);
-    seniorityFit = matches ? 1 : 0.2;
+    const ranks = intent.seniority
+      .map((s) => jobSeniorityRank(canonicalSeniority(s)))
+      .filter((r) => r != null);
+    if (ranks.length) {
+      explicitSeniority = true;
+      const js = job.job_seniority && job.job_seniority !== "unknown"
+        ? job.job_seniority
+        : inferSeniorityFromTitle(job.job_title);
+      const jRank = jobSeniorityRank(js);
+      if (jRank == null) {
+        seniorityFit = 0.4;
+      } else {
+        const closest = Math.min(...ranks);
+        seniorityGap = jRank - closest;
+        seniorityFit = seniorityGap === 0 ? 1 : seniorityGap === 1 ? 0.4 : seniorityGap === -1 ? 0.6 : 0.1;
+      }
+    }
   }
 
   // Industry/domain fit (lexical only, cheap).
@@ -1358,6 +1413,15 @@ function hybridScore(job, intent, titleVec, descVec, qTitleVec, qDescVec) {
     seniorityFit * 0.10 +
     industryFit * 0.05 +
     freshness * 0.05;
+
+  // Hard seniority eligibility: explicit intent with a large gap scales the whole
+  // score down so far-off-seniority roles fall out of the eligible pool.
+  if (explicitSeniority) {
+    if (seniorityGap >= 3) return { base: base * 0.3, roleFit, skillsFit, respFit, seniorityFit, industryFit, freshness, seniorityGap };
+    if (seniorityGap === 2) return { base: base * 0.45, roleFit, skillsFit, respFit, seniorityFit, industryFit, freshness, seniorityGap };
+    if (seniorityGap === 1) return { base: base * 0.7, roleFit, skillsFit, respFit, seniorityFit, industryFit, freshness, seniorityGap };
+    if (seniorityGap <= -2) return { base: base * 0.7, roleFit, skillsFit, respFit, seniorityFit, industryFit, freshness, seniorityGap };
+  }
 
   return { base, roleFit, skillsFit, respFit, seniorityFit, industryFit, freshness };
 }
@@ -1612,10 +1676,16 @@ const CITY_COUNTRIES = {
 function inferCountry(location) {
   if (!location) return null;
   const s = String(location).toLowerCase();
-  const city = s.split(",")[0].trim();
+  const first = s.split(",")[0].trim();
+  const city = first.split(";")[0].trim();
   if (CITY_COUNTRIES[city]) return CITY_COUNTRIES[city];
   const compact = city.replace(/[^a-z0-9]+/g, "");
   if (CITY_COUNTRIES[compact]) return CITY_COUNTRIES[compact];
+  // Common region / multi-word location fallbacks.
+  if (/(bay area|san francisco|california|silicon valley)/.test(s)) return "United States";
+  if (/(new york|nyc)/.test(s)) return "United States";
+  if (/(greater london|united kingdom|uk)\b/.test(s)) return "United Kingdom";
+  if (/(netherlands|amsterdam)/.test(s)) return "Netherlands";
   return null;
 }
 __name(inferCountry, "inferCountry");
@@ -2095,16 +2165,31 @@ function locationTier(profile, job) {
     }
   }
 
-  // Country / region match (also catches "Remote EU" style).
+  // Country / region match.
   for (const l of locs) {
     if (l === "remote") continue;
-    // Match city against a city the job lists, or country against country.
     if (country && country.includes(l)) return { bonus: 3, tier: "country" };
     if (loc && loc.includes(l)) return { bonus: 3, tier: "region" };
-    // "remote eu" -> job is remote and in an EU country
-    if (l.startsWith("remote ") && isRemote && country && l.slice(7) && (country.includes(l.slice(7)) || isEuCountry(country))) {
-      return { bonus: 7, tier: "compatible_remote" };
-    }
+  }
+
+  // Region-restricted remote preference (e.g. "remote eu", "remote us", "emea").
+  // Parse the region from the preference and compare against the job's actual
+  // remote region(s), so "remote EU" is region compatibility, not just "remote".
+  const prefRegions = locs.map(regionFor).filter(Boolean);
+  const jobRegions = new Set((job.remote_regions || []).map((r) => String(r).toLowerCase()));
+  if (prefRegions.length) {
+    const inRegion = prefRegions.some((r) =>
+      r === "worldwide" ||
+      jobRegions.has(r) ||
+      (r === "eu" && isEuCountry(country)) ||
+      (country && regionFor(country) === r)
+    );
+    // Remote in the preferred region: best.
+    if (isRemote && inRegion) return { bonus: 7, tier: "compatible_remote" };
+    // On-site but in the preferred region: partial.
+    if (inRegion) return { bonus: -5, tier: "incompatible" };
+    // Wrong region (remote or on-site): strong penalty.
+    return { bonus: -12, tier: "region_mismatch" };
   }
 
   // Compatible remote: candidate wants remote and job is remote.
@@ -2119,9 +2204,24 @@ function locationTier(profile, job) {
   return { bonus: -5, tier: "incompatible" };
 }
 __name(locationTier, "locationTier");
+function regionFor(s) {
+  const t = String(s || "").toLowerCase().trim();
+  if (!t) return null;
+  if (/\b(europe|eu|emea|european union)\b/.test(t)) return "eu";
+  if (/\b(uk|united kingdom|gb|great britain|britain)\b/.test(t)) return "uk";
+  if (/\b(us|usa|united states|america|north america)\b/.test(t)) return "us";
+  if (/\b(apac|asia pacific|asia)\b/.test(t)) return "apac";
+  if (/\b(worldwide|anywhere|global)\b/.test(t)) return "worldwide";
+  if (EU_CODES.has(t)) return "eu";
+  return null;
+}
+__name(regionFor, "regionFor");
+const EU_NAMES = new Set(["austria", "belgium", "bulgaria", "croatia", "cyprus", "czech republic", "czechia", "denmark", "estonia", "finland", "france", "germany", "greece", "hungary", "ireland", "italy", "latvia", "lithuania", "luxembourg", "malta", "netherlands", "poland", "portugal", "romania", "slovakia", "slovenia", "spain", "sweden"]);
+const EU_CODES = new Set(["at", "be", "bg", "hr", "cy", "cz", "dk", "ee", "fi", "fr", "de", "gr", "hu", "ie", "it", "lv", "lt", "lu", "mt", "nl", "pl", "pt", "ro", "sk", "si", "es", "se"]);
 function isEuCountry(country) {
-  const eu = new Set(["austria", "belgium", "bulgaria", "croatia", "cyprus", "czech republic", "czechia", "denmark", "estonia", "finland", "france", "germany", "greece", "hungary", "ireland", "italy", "latvia", "lithuania", "luxembourg", "malta", "netherlands", "poland", "portugal", "romania", "slovakia", "slovenia", "spain", "sweden"]);
-  return eu.has(String(country).toLowerCase());
+  let c = String(country || "").toLowerCase().trim();
+  if (c.startsWith("the ")) c = c.slice(4);
+  return EU_NAMES.has(c) || EU_CODES.has(c);
 }
 __name(isEuCountry, "isEuCountry");
 async function analyzeCV(text, env) {

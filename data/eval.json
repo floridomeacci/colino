@@ -1,15 +1,80 @@
 {
   "queries": [
-    { "query": "creative technologist amsterdam", "notes": "Creative/design-technology roles in Amsterdam" },
-    { "query": "senior product designer remote eu", "notes": "Senior product design, remote within EU" },
-    { "query": "junior motion designer", "notes": "Entry-level motion design" },
-    { "query": "ai engineer willing to relocate", "notes": "AI engineering, open to moving" },
-    { "query": "design leader hybrid rotterdam", "notes": "Design leadership, hybrid in Rotterdam" },
-    { "query": "machine learning engineer", "notes": "ML engineering" },
-    { "query": "product manager fintech", "notes": "Product management in fintech" },
-    { "query": "frontend developer react", "notes": "Frontend engineering with React" },
-    { "query": "data analyst", "notes": "Data analysis" },
-    { "query": "ux researcher", "notes": "UX research" }
+    {
+      "query": "creative technologist amsterdam",
+      "assert": {
+        "roles": ["creative technologist", "design technologist", "technical artist", "creative developer"],
+        "locations": ["amsterdam", "netherlands"],
+        "forbidden": ["backend engineer", "data engineer"]
+      }
+    },
+    {
+      "query": "senior product designer remote eu",
+      "assert": {
+        "roles": ["product designer"],
+        "seniority": ["senior"],
+        "locations": ["eu", "europe", "netherlands", "germany", "remote eu"],
+        "forbidden": ["sales engineer", "marketing analyst", "pr manager"]
+      }
+    },
+    {
+      "query": "junior motion designer",
+      "assert": {
+        "roles": ["motion designer", "motion graphics"],
+        "seniority": ["entry", "junior", "intern"],
+        "forbidden": ["staff", "senior", "lead"]
+      }
+    },
+    {
+      "query": "ai engineer willing to relocate",
+      "assert": {
+        "roles": ["ai engineer", "machine learning", "ml engineer"],
+        "forbidden": ["sales"]
+      }
+    },
+    {
+      "query": "design leader hybrid rotterdam",
+      "assert": {
+        "roles": ["lead designer", "head of design", "design director", "design lead", "creative lead"],
+        "locations": ["rotterdam", "netherlands"],
+        "forbidden": ["junior", "intern"]
+      }
+    },
+    {
+      "query": "machine learning engineer",
+      "assert": {
+        "roles": ["machine learning", "ml engineer", "ai engineer"],
+        "forbidden": ["accountant", "recruiter"]
+      }
+    },
+    {
+      "query": "product manager fintech",
+      "assert": {
+        "roles": ["product manager"],
+        "forbidden": ["software engineer"]
+      }
+    },
+    {
+      "query": "frontend developer react",
+      "assert": {
+        "roles": ["frontend", "front-end", "front end", "react developer"],
+        "forbidden": ["backend"]
+      }
+    },
+    {
+      "query": "data analyst",
+      "assert": {
+        "roles": ["data analyst", "analytics"],
+        "forbidden": ["software engineer", "account manager"]
+      }
+    },
+    {
+      "query": "ux researcher",
+      "assert": {
+        "roles": ["ux researcher", "user researcher", "design researcher"],
+        "forbidden": ["backend", "security researcher", "quantitative"]
+      }
+    }
   ],
-  "metrics": ["precision_at_5", "ndcg_at_10", "no_result_rate", "irrelevant_rate", "location_satisfaction", "company_diversity"]
+  "metrics": ["role_relevance", "seniority_compatibility", "location_compatibility", "deduplication", "required_fields", "no_forbidden_roles", "latency"]
 }

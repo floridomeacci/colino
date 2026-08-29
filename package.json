@@ -7,7 +7,9 @@
     "dev": "wrangler dev --env-file .env",
     "deploy": "wrangler deploy",
     "collect": "node collectors/index.mjs",
-    "eval": "node collectors/eval.mjs"
+    "eval": "node collectors/eval.mjs full",
+    "eval:full": "node collectors/eval.mjs full",
+    "eval:fast": "node collectors/eval.mjs fast"
   },
   "keywords": [],
   "author": "",
