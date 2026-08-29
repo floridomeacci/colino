@@ -676,29 +676,49 @@ async function runDiscovery(id, query, env) {
     if (!raw) return;
     // Transition queued -> processing immediately, before external work.
     raw.status = "processing";
+    raw.failed = raw.failed || [];
+    raw.last_progress_at = Date.now();
     await env.JOBS_KV.put(`disc:${id}`, JSON.stringify(raw), { expirationTtl: 3600 });
-    // Phase 1: propose companies.
-    const system = "You are a company directory. Your ONLY job is to name 100 companies that employ people in a given field. A company is an employer: a firm, studio, agency, or corporation that has employees and posts job openings. Never output concepts, movements, styles, buildings, or individual people.\n\nOutput exactly one company name per line. No numbers, no dashes, no bullets, no explanations.\n\nFor the field \"architecture\", correct answers look like:\nFoster + Partners\nBIG\nOMA\nSnøhetta\nUNStudio\nMVRDV\nPerkins&Will\nGensler";
+    // Phase 1: propose companies (a smaller, faster list).
+    const system = "You are a company directory. Your ONLY job is to name 20 companies that employ people in a given field. A company is an employer: a firm, studio, agency, or corporation that has employees and posts job openings. Never output concepts, movements, styles, buildings, or individual people.\n\nOutput exactly one company name per line. No numbers, no dashes, no bullets, no explanations.\n\nFor the field \"architecture\", correct answers look like:\nFoster + Partners\nBIG\nOMA\nSnøhetta\nUNStudio\nMVRDV\nPerkins&Will\nGensler";
     console.log("[discovery] calling LLM", id);
-    const rawText = await llmChat(env, system, `Field: ${query}\n\nList 100 companies that employ people in this field:`, 4000);
+    const rawText = await llmChat(env, system, `Field: ${query}\n\nList 20 companies that employ people in this field:`, 2000);
     console.log("[discovery] LLM returned", id, String(rawText).length);
-    const companies = parseCompanyList(rawText).slice(0, 100);
+    const companies = parseCompanyList(rawText).slice(0, 20);
     raw.companies = companies;
     await env.JOBS_KV.put(`disc:${id}`, JSON.stringify(raw), { expirationTtl: 3600 });
-    // Phase 2: fetch jobs for each company (batched to bound memory).
-    for (const company of companies) {
-      if (raw.completed.includes(company)) continue;
-      const jobs = await storeCompanyJobs(company, env);
-      raw.completed.push(company);
-      const seen = new Set(raw.jobs.map((j) => j.url));
-      for (const j of jobs) if (!seen.has(j.url)) { seen.add(j.url); raw.jobs.push(j); }
+    // Phase 2: fetch jobs with a bounded concurrency pool and per-company timeout.
+    const pending = companies.filter((c) => !raw.completed.includes(c));
+    let lastSave = Date.now();
+    const { failed } = await collectCompaniesTracked(pending, env, async () => {
+      // Throttle KV writes to one per ~2s to bound latency.
+      const now = Date.now();
+      if (now - lastSave < 2000) return;
+      lastSave = now;
+      raw.last_progress_at = now;
       await env.JOBS_KV.put(`disc:${id}`, JSON.stringify(raw), { expirationTtl: 3600 });
-    }
+    });
+    // Merge the collected jobs into the snapshot (collectCompaniesTracked already persisted per-company via storeCompanyJobs).
+    for (const c of pending) raw.completed.push(c);
+    raw.failed = (raw.failed || []).concat(failed);
+    raw.last_progress_at = Date.now();
     raw.status = "complete";
+    // Read back the accumulated jobs from the DB so the snapshot reflects everything.
+    const dbJobs = await getAtsDb(env);
+    raw.jobs = dbJobs.filter((j) => companies.includes(normalizeCompanyName(j.company_name)) || companies.includes(j.company_name));
     await env.JOBS_KV.put(`disc:${id}`, JSON.stringify(raw), { expirationTtl: 3600 });
-    console.log("[discovery] complete", id, raw.jobs.length);
+    console.log("[discovery] complete", id, raw.jobs.length, "failed:", failed.length);
   } catch (err) {
     console.error("[discovery] background job failed:", err && err.message);
+    try {
+      const raw = await env.JOBS_KV.get(`disc:${id}`, { type: "json" });
+      if (raw && raw.status !== "complete") {
+        raw.status = "failed";
+        raw.last_error = String(err && err.message ? err.message : err);
+        raw.last_progress_at = Date.now();
+        await env.JOBS_KV.put(`disc:${id}`, JSON.stringify(raw), { expirationTtl: 3600 });
+      }
+    } catch (e) {}
   }
 }
 __name(runDiscovery, "runDiscovery");
@@ -715,8 +735,12 @@ async function handleDiscoveryStatus(request, env) {
       status: raw.status,
       companies_completed: raw.completed.length,
       companies_total: raw.companies ? raw.companies.length : 0,
+      companies_failed: (raw.failed || []).length,
+      failed: raw.failed || [],
       suggested_companies: raw.companies || [],
-      jobs: raw.jobs
+      jobs: raw.jobs,
+      last_progress_at: raw.last_progress_at ? new Date(raw.last_progress_at).toISOString() : null,
+      last_error: raw.last_error || null
     });
   } catch (err) {
     return jsonResponse({ error: err && err.message ? err.message : String(err) }, err.status || 500);
@@ -1059,6 +1083,47 @@ async function storeCompanyJobs(company, env) {
   return fresh;
 }
 __name(storeCompanyJobs, "storeCompanyJobs");
+// Fetch a single company's jobs with a hard timeout, so one hung ATS can't stall the queue.
+async function fetchCompanyWithTimeout(company, env, ms = 7000) {
+  let timer;
+  try {
+    return await Promise.race([
+      storeCompanyJobs(company, env),
+      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("timeout")), ms); })
+    ]);
+  } catch (err) {
+    return [];
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+__name(fetchCompanyWithTimeout, "fetchCompanyWithTimeout");
+// Fetch a list of companies with a bounded concurrency pool, returning per-company results.
+async function collectCompaniesTracked(companies, env, onProgress) {
+  const completed = [];
+  const failed = [];
+  const jobs = [];
+  const CONCURRENCY = 6;
+  let idx = 0;
+  async function worker() {
+    while (idx < companies.length) {
+      const company = companies[idx++];
+      try {
+        const got = await fetchCompanyWithTimeout(company, env);
+        jobs.push(...got);
+        completed.push(company);
+      } catch (err) {
+        failed.push({ company, error: String(err && err.message ? err.message : err) });
+      }
+      if (onProgress) onProgress(company, completed.length, failed.length);
+    }
+  }
+  const pool = [];
+  for (let i = 0; i < Math.min(CONCURRENCY, companies.length); i++) pool.push(worker());
+  await Promise.all(pool);
+  return { completed, failed, jobs };
+}
+__name(collectCompaniesTracked, "collectCompaniesTracked");
 async function getAtsDb(env) {
   if (!env || !env.JOBS_KV) return [];
   const list = await env.JOBS_KV.list({ prefix: "ats:" });

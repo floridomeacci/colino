@@ -454,6 +454,10 @@
           status: res.status,
           companies_completed: res.companies_completed,
           companies_total: res.companies_total,
+          companies_failed: res.companies_failed ?? 0,
+          failed: res.failed || [],
+          last_progress_at: res.last_progress_at,
+          last_error: res.last_error,
           jobs
         });
       })
