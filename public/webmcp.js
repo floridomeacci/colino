@@ -34,9 +34,9 @@
     }
   }
 
-  const register = (name, description, inputSchema, execute) => {
+  const register = async (name, title, description, inputSchema, execute) => {
     try {
-      document.modelContext.registerTool({ name, description, inputSchema, execute });
+      await document.modelContext.registerTool({ name, title, description, inputSchema, execute });
     } catch (err) {
       console.warn(`[webmcp] failed to register "${name}"`, err);
     }
@@ -44,6 +44,7 @@
 
   register(
     "search_jobs",
+    "Search jobs",
     "Search the Colino job database by a natural-language query and return matching job listings (title, company, location, seniority, URL).",
     {
       type: "object",
@@ -81,6 +82,7 @@
 
   register(
     "get_job_details",
+    "Job details",
     "Get full details for a specific job listing, including its description, given its URL.",
     {
       type: "object",
@@ -103,6 +105,7 @@
 
   register(
     "get_companies",
+    "Companies",
     "List the companies currently represented in the Colino database, with job counts.",
     {
       type: "object",
@@ -129,6 +132,7 @@
 
   register(
     "get_stats",
+    "Platform stats",
     "Return aggregate platform statistics: total jobs, number of companies, and seniority distribution.",
     {
       type: "object",
@@ -149,6 +153,7 @@
 
   register(
     "propose_companies",
+    "Propose companies",
     "Given a role or domain, generate a list of companies that hire for it, then fetch their live job postings. Returns the suggested companies and the jobs discovered.",
     {
       type: "object",
