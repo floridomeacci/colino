@@ -14,8 +14,9 @@
   const API = (path, opts) =>
     fetch(path, opts).then((r) => r.json());
 
+  // WebMCP's executeTool resolves to a DOMString: execute must return a string.
   function text(content) {
-    return { content: [{ type: "text", text: typeof content === "string" ? content : JSON.stringify(content, null, 2) }] };
+    return typeof content === "string" ? content : JSON.stringify(content, null, 2);
   }
 
   const MAX_RESULTS = 50;
