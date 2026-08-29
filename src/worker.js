@@ -3,7 +3,7 @@ var __name = (target, value) => __defProp(target, "name", { value, configurable:
 
 // src/worker.js
 var worker_default = {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     try {
       const url = new URL(request.url);
       if (request.method === "OPTIONS") {
@@ -64,7 +64,7 @@ var worker_default = {
         return handleSearch(request, env);
       }
       if (url.pathname === "/api/discovery/start" && request.method === "POST") {
-        return handleDiscoveryStart(request, env);
+        return handleDiscoveryStart(request, env, ctx);
       }
       if (url.pathname === "/api/discovery/status" && request.method === "POST") {
         return handleDiscoveryStatus(request, env);
@@ -523,12 +523,31 @@ async function handleSearch(request, env) {
     }
     scored = applyVotes(scored, likes, dislikes);
     scored = applyLocationFilter(scored, locationTags);
+    scored = applyRelevanceGate(scored, tags);
     return jsonResponse({ jobs: scored.slice(0, 500), total: scored.length });
   } catch (err) {
     return jsonResponse({ error: err && err.message ? err.message : String(err) }, err.status || 500);
   }
 }
 __name(handleSearch, "handleSearch");
+const RELEVANCE_STOP = new Set(["the", "a", "an", "and", "or", "for", "in", "at", "on", "of", "to", "with", "jobs", "job", "roles", "role", "work", "position", "positions", "looking", "look", "find", "show", "search", "remote", "i", "me", "my", "we", "you", "our"]);
+function applyRelevanceGate(scored, tags) {
+  if (!scored.length) return scored;
+  const terms = tags
+    .map((t) => String(t).toLowerCase())
+    .filter((t) => t.length > 2 && !RELEVANCE_STOP.has(t) && !isLocationTag(t));
+  if (!terms.length) return scored;
+  return scored.filter((j) => {
+    const title = (j.job_title || "").toLowerCase();
+    const desc = (j.description || "").toLowerCase().slice(0, 400);
+    const titleHits = terms.some((t) => title.includes(t));
+    if (titleHits) return true;
+    // Description alone must match all terms (or the only term) to be convincing.
+    const descHits = terms.every((t) => desc.includes(t));
+    return descHits;
+  });
+}
+__name(applyRelevanceGate, "applyRelevanceGate");
 let _LOCATION_KEYWORDS = null;
 function locationKeywords() {
   if (!_LOCATION_KEYWORDS) {
@@ -624,7 +643,7 @@ async function proposeAndFetchCompanies(env, query) {
   return { companies, jobs };
 }
 __name(proposeAndFetchCompanies, "proposeAndFetchCompanies");
-async function handleDiscoveryStart(request, env) {
+async function handleDiscoveryStart(request, env, ctx) {
   try {
     const body = await readJsonBody(request);
     const query = sanitizeText(body.query, 400);
@@ -640,12 +659,43 @@ async function handleDiscoveryStart(request, env) {
       created_at: Date.now()
     };
     await env.JOBS_KV.put(`disc:${id}`, JSON.stringify(state), { expirationTtl: 3600 });
+    // Kick off the expensive work in the background; return immediately.
+    if (ctx && typeof ctx.waitUntil === "function") {
+      ctx.waitUntil(runDiscovery(id, query, env));
+    }
     return jsonResponse({ operation_id: id, status: "queued" });
   } catch (err) {
     return jsonResponse({ error: err && err.message ? err.message : String(err) }, err.status || 500);
   }
 }
 __name(handleDiscoveryStart, "handleDiscoveryStart");
+async function runDiscovery(id, query, env) {
+  try {
+    const raw = await env.JOBS_KV.get(`disc:${id}`, { type: "json" });
+    if (!raw) return;
+    // Phase 1: propose companies.
+    const system = "You are a company directory. Your ONLY job is to name 100 companies that employ people in a given field. A company is an employer: a firm, studio, agency, or corporation that has employees and posts job openings. Never output concepts, movements, styles, buildings, or individual people.\n\nOutput exactly one company name per line. No numbers, no dashes, no bullets, no explanations.\n\nFor the field \"architecture\", correct answers look like:\nFoster + Partners\nBIG\nOMA\nSnøhetta\nUNStudio\nMVRDV\nPerkins&Will\nGensler";
+    const rawText = await chatCompletion(env.REPLICATE_API_KEY, system, `Field: ${query}\n\nList 100 companies that employ people in this field:`, 4000);
+    const companies = parseCompanyList(rawText).slice(0, 100);
+    raw.companies = companies;
+    raw.status = companies.length ? "processing" : "complete";
+    await env.JOBS_KV.put(`disc:${id}`, JSON.stringify(raw), { expirationTtl: 3600 });
+    // Phase 2: fetch jobs for each company (batched to bound memory).
+    for (const company of companies) {
+      if (raw.completed.includes(company)) continue;
+      const jobs = await storeCompanyJobs(company, env);
+      raw.completed.push(company);
+      const seen = new Set(raw.jobs.map((j) => j.url));
+      for (const j of jobs) if (!seen.has(j.url)) { seen.add(j.url); raw.jobs.push(j); }
+      await env.JOBS_KV.put(`disc:${id}`, JSON.stringify(raw), { expirationTtl: 3600 });
+    }
+    raw.status = "complete";
+    await env.JOBS_KV.put(`disc:${id}`, JSON.stringify(raw), { expirationTtl: 3600 });
+  } catch (err) {
+    console.error("[discovery] background job failed:", err && err.message);
+  }
+}
+__name(runDiscovery, "runDiscovery");
 async function handleDiscoveryStatus(request, env) {
   try {
     const body = await readJsonBody(request);
@@ -653,51 +703,13 @@ async function handleDiscoveryStatus(request, env) {
     if (!id) return jsonResponse({ error: "operation_id required" }, 400);
     const raw = await env.JOBS_KV.get(`disc:${id}`, { type: "json" });
     if (!raw) return jsonResponse({ error: "operation not found" }, 404);
-    if (raw.status === "complete") {
-      return jsonResponse({
-        operation_id: id,
-        status: "complete",
-        companies_completed: raw.completed.length,
-        companies_total: raw.companies ? raw.companies.length : 0,
-        suggested_companies: raw.companies || [],
-        jobs: raw.jobs
-      });
-    }
-    // Phase 1: propose companies (one LLM call, kept off the start endpoint).
-    if (raw.status === "queued") {
-      const system = "You are a company directory. Your ONLY job is to name 100 companies that employ people in a given field. A company is an employer: a firm, studio, agency, or corporation that has employees and posts job openings. Never output concepts, movements, styles, buildings, or individual people.\n\nOutput exactly one company name per line. No numbers, no dashes, no bullets, no explanations.\n\nFor the field \"architecture\", correct answers look like:\nFoster + Partners\nBIG\nOMA\nSnøhetta\nUNStudio\nMVRDV\nPerkins&Will\nGensler";
-      const rawText = await chatCompletion(env.REPLICATE_API_KEY, system, `Field: ${raw.query}\n\nList 100 companies that employ people in this field:`, 4000);
-      raw.companies = parseCompanyList(rawText).slice(0, 100);
-      raw.status = raw.companies.length ? "processing" : "complete";
-      await env.JOBS_KV.put(`disc:${id}`, JSON.stringify(raw), { expirationTtl: 3600 });
-      return jsonResponse({
-        operation_id: id,
-        status: raw.status,
-        companies_completed: 0,
-        companies_total: raw.companies.length,
-        suggested_companies: raw.companies,
-        jobs: raw.jobs
-      });
-    }
-    // Phase 2: fetch jobs for a few companies per poll.
-    const BATCH = 5;
-    const pending = raw.companies.filter((c) => !raw.completed.includes(c));
-    const batch = pending.slice(0, BATCH);
-    const newJobs = [];
-    for (const company of batch) {
-      const jobs = await storeCompanyJobs(company, env);
-      newJobs.push(...jobs);
-    }
-    raw.completed.push(...batch);
-    const seen = new Set(raw.jobs.map((j) => j.url));
-    for (const j of newJobs) if (!seen.has(j.url)) { seen.add(j.url); raw.jobs.push(j); }
-    raw.status = raw.completed.length >= raw.companies.length ? "complete" : "processing";
-    await env.JOBS_KV.put(`disc:${id}`, JSON.stringify(raw), { expirationTtl: 3600 });
+    // Always return the stored snapshot immediately; never await discovery work here.
     return jsonResponse({
       operation_id: id,
       status: raw.status,
       companies_completed: raw.completed.length,
-      companies_total: raw.companies.length,
+      companies_total: raw.companies ? raw.companies.length : 0,
+      suggested_companies: raw.companies || [],
       jobs: raw.jobs
     });
   } catch (err) {
