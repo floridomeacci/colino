@@ -40,6 +40,16 @@
     return String(str || "").slice(0, max).trim();
   }
 
+  // Executor-level validation: WebMCP does not guarantee runtime schema enforcement.
+  function checkRange(input, key, min, max) {
+    if (input[key] == null) return null;
+    const n = Number(input[key]);
+    if (!Number.isFinite(n) || n < min || n > max) {
+      return `'${key}' must be between ${min} and ${max}`;
+    }
+    return null;
+  }
+
   function jobId(j) {
     return j.job_posting_id || null;
   }
@@ -93,7 +103,8 @@
       type: "object",
       properties: {
         query: { type: "string", minLength: 1, maxLength: 200, description: "Natural-language query, e.g. 'senior product designer'." },
-        locations: { type: "array", items: { type: "string" }, description: "Locations to prefer, e.g. ['Amsterdam', 'Remote EU']." },
+        preferred_locations: { type: "array", items: { type: "string" }, description: "Locations to prefer when ranking, e.g. ['Amsterdam', 'Remote EU']. Jobs elsewhere are not removed, just ranked lower." },
+        location_mode: { type: "string", enum: ["prefer", "strict"], default: "prefer", description: "'prefer' (default) boosts matching locations; 'strict' keeps only jobs matching preferred_locations." },
         seniority: { type: "array", items: { type: "string", enum: ["intern", "entry", "associate", "mid", "senior", "lead", "manager", "director", "executive"] }, description: "Seniority levels to include." },
         employment_types: { type: "array", items: { type: "string", enum: ["full_time", "part_time", "contract", "internship"] }, description: "Employment types to include." },
         remote: { type: "boolean", description: "True for remote-only, false for on-site only. Omit for either." },
@@ -110,10 +121,18 @@
       safe(async () => {
         const q = clean(input.query, MAX_QUERY);
         if (!q) return fail("INVALID_INPUT", "query is required");
-        const limit = Math.min(Math.max(Number(input.limit) || 10, 1), MAX_RESULTS);
-        const offset = Math.max(Number(input.cursor) || 0, 0);
+        if (q.length > MAX_QUERY) return fail("INVALID_INPUT", `query must be at most ${MAX_QUERY} characters`);
+        const limitErr = checkRange(input, "limit", 1, MAX_RESULTS);
+        if (limitErr) return fail("INVALID_INPUT", limitErr);
+        const cursorErr = checkRange(input, "cursor", 0, 100000);
+        if (cursorErr) return fail("INVALID_INPUT", cursorErr);
+        const daysErr = input.posted_within_days != null ? checkRange(input, "posted_within_days", 1, 365) : null;
+        if (daysErr) return fail("INVALID_INPUT", daysErr);
+        const limit = Number(input.limit) || 10;
+        const offset = Number(input.cursor) || 0;
         const tags = [q];
-        if (Array.isArray(input.locations)) tags.push(...input.locations.map((s) => clean(s, 100)).filter(Boolean));
+        const locs = (Array.isArray(input.preferred_locations) ? input.preferred_locations : (Array.isArray(input.locations) ? input.locations : []));
+        locs.forEach((s) => { const c = clean(s, 100); if (c) tags.push(c); });
         const res = await API("/api/search", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -123,6 +142,12 @@
         let jobs = res.jobs || [];
 
         // Structured filters (post-filtering since /api/search is semantic).
+        if (input.location_mode === "strict" && locs.length) {
+          jobs = jobs.filter((j) => {
+            const jl = `${j.job_location || ""} ${j.country || ""}`.toLowerCase();
+            return locs.some((l) => jl.includes(l.toLowerCase()));
+          });
+        }
         if (Array.isArray(input.seniority) && input.seniority.length) {
           const want = input.seniority.map((s) => String(s).toLowerCase());
           jobs = jobs.filter((j) => want.includes(String(j.job_seniority || "unknown").toLowerCase()));
@@ -135,8 +160,10 @@
           });
         }
         if (typeof input.remote === "boolean") {
-          const isRemote = /remote/i.test(`${j.job_location || ""} ${j.workplace_type || ""}`.toLowerCase());
-          jobs = jobs.filter((j) => isRemote === input.remote);
+          jobs = jobs.filter((j) => {
+            const isRemote = /remote/i.test(`${j.job_location || ""} ${j.workplace_type || ""}`.toLowerCase());
+            return isRemote === input.remote;
+          });
         }
         if (Number(input.posted_within_days) > 0) {
           const cutoff = Date.now() - Number(input.posted_within_days) * 86400000;
@@ -180,7 +207,11 @@
       properties: {
         job_id: { type: "string", minLength: 1, description: "The stable job_id returned by search-jobs." },
         source_url: { type: "string", description: "Fallback: look up by the source URL instead." }
-      }
+      },
+      anyOf: [
+        { required: ["job_id"] },
+        { required: ["source_url"] }
+      ]
     },
     async (input) =>
       safe(async () => {
@@ -248,6 +279,8 @@
     },
     async (input) =>
       safe(async () => {
+        const limitErr = checkRange(input, "limit", 1, MAX_RESULTS);
+        if (limitErr) return fail("INVALID_INPUT", limitErr);
         const jobs = await API("/api/jobs");
         const counts = new Map();
         for (const j of jobs) {
@@ -257,7 +290,7 @@
         let entries = [...counts.entries()].sort((a, b) => b[1] - a[1]);
         const q = clean(input.query, 100).toLowerCase();
         if (q) entries = entries.filter(([name]) => name.toLowerCase().includes(q));
-        const limit = Math.min(Math.max(Number(input.limit) || 20, 1), MAX_RESULTS);
+        const limit = Number(input.limit) || 20;
         return ok({ companies: entries.slice(0, limit).map(([company, jobs]) => ({ company, jobs })) });
       })
   );
@@ -316,9 +349,11 @@
     },
     async (input) =>
       safe(async () => {
+        const limitErr = checkRange(input, "limit", 1, MAX_RESULTS);
+        if (limitErr) return fail("INVALID_INPUT", limitErr);
         const profile = window.__colinoProfile;
         if (!profile) return fail("NO_PROFILE", "No resume has been uploaded in this session yet.");
-        const limit = Math.min(Math.max(Number(input.limit) || 10, 1), MAX_RESULTS);
+        const limit = Number(input.limit) || 10;
         const res = await API("/api/match-profile", {
           method: "POST",
           headers: { "Content-Type": "application/json" },

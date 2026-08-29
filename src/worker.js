@@ -593,22 +593,18 @@ async function handleDiscoveryStart(request, env) {
     const body = await readJsonBody(request);
     const query = sanitizeText(body.query, 400);
     if (!query) return jsonResponse({ error: "No query" }, 400);
-    const system = "You are a company directory. Your ONLY job is to name 100 companies that employ people in a given field. A company is an employer: a firm, studio, agency, or corporation that has employees and posts job openings. Never output concepts, movements, styles, buildings, or individual people.\n\nOutput exactly one company name per line. No numbers, no dashes, no bullets, no explanations.\n\nFor the field \"architecture\", correct answers look like:\nFoster + Partners\nBIG\nOMA\nSnøhetta\nUNStudio\nMVRDV\nPerkins&Will\nGensler";
-    const raw = await chatCompletion(env.REPLICATE_API_KEY, system, `Field: ${query}\n\nList 100 companies that employ people in this field:`, 4000);
-    const companies = parseCompanyList(raw).slice(0, 100);
-    if (!companies.length) return jsonResponse({ error: "No companies proposed" }, 502);
     const id = "disc_" + crypto.randomUUID().slice(0, 8);
     const state = {
       id,
       query,
-      companies,
+      companies: null,
       completed: [],
       jobs: [],
-      status: "processing",
+      status: "queued",
       created_at: Date.now()
     };
     await env.JOBS_KV.put(`disc:${id}`, JSON.stringify(state), { expirationTtl: 3600 });
-    return jsonResponse({ operation_id: id, status: "processing", suggested_companies: companies });
+    return jsonResponse({ operation_id: id, status: "queued" });
   } catch (err) {
     return jsonResponse({ error: err && err.message ? err.message : String(err) }, err.status || 500);
   }
@@ -626,11 +622,28 @@ async function handleDiscoveryStatus(request, env) {
         operation_id: id,
         status: "complete",
         companies_completed: raw.completed.length,
-        companies_total: raw.companies.length,
+        companies_total: raw.companies ? raw.companies.length : 0,
+        suggested_companies: raw.companies || [],
         jobs: raw.jobs
       });
     }
-    // Process a few companies per call to stay within the browser bridge timeout.
+    // Phase 1: propose companies (one LLM call, kept off the start endpoint).
+    if (raw.status === "queued") {
+      const system = "You are a company directory. Your ONLY job is to name 100 companies that employ people in a given field. A company is an employer: a firm, studio, agency, or corporation that has employees and posts job openings. Never output concepts, movements, styles, buildings, or individual people.\n\nOutput exactly one company name per line. No numbers, no dashes, no bullets, no explanations.\n\nFor the field \"architecture\", correct answers look like:\nFoster + Partners\nBIG\nOMA\nSnøhetta\nUNStudio\nMVRDV\nPerkins&Will\nGensler";
+      const rawText = await chatCompletion(env.REPLICATE_API_KEY, system, `Field: ${raw.query}\n\nList 100 companies that employ people in this field:`, 4000);
+      raw.companies = parseCompanyList(rawText).slice(0, 100);
+      raw.status = raw.companies.length ? "processing" : "complete";
+      await env.JOBS_KV.put(`disc:${id}`, JSON.stringify(raw), { expirationTtl: 3600 });
+      return jsonResponse({
+        operation_id: id,
+        status: raw.status,
+        companies_completed: 0,
+        companies_total: raw.companies.length,
+        suggested_companies: raw.companies,
+        jobs: raw.jobs
+      });
+    }
+    // Phase 2: fetch jobs for a few companies per poll.
     const BATCH = 5;
     const pending = raw.companies.filter((c) => !raw.completed.includes(c));
     const batch = pending.slice(0, BATCH);
@@ -934,6 +947,10 @@ async function getAtsDb(env) {
         } else {
           j.job_seniority = "unknown";
         }
+        if (j.job_seniority === "unknown") {
+          const inferred = inferSeniorityFromTitle(j.job_title);
+          if (inferred !== "unknown") j.job_seniority = inferred;
+        }
         j.last_verified_at = j.collected_at ? new Date(j.collected_at).toISOString() : null;
         j.is_active = !!j.collected_at && j.collected_at >= cutoff;
         j.company_name = normalizeCompanyName(j.company_name);
@@ -1080,6 +1097,24 @@ function canonicalSeniority(raw) {
   return "unknown";
 }
 __name(canonicalSeniority, "canonicalSeniority");
+// Infer a canonical seniority from the job title when the ATS did not provide one.
+function inferSeniorityFromTitle(title) {
+  const t = String(title || "").toLowerCase();
+  if (!t) return "unknown";
+  if (/\b(intern|internship|trainee|apprentice)\b/.test(t)) return "intern";
+  if (/\b(junior|entry[- ]?level|graduate|grad)\b/.test(t)) return "entry";
+  if (/\b(senior|sr\.?|lead|staff|principal|head of|director|vp|vice president|chief|executive|head)\b/.test(t)) {
+    if (/\b(vp|vice president|chief|executive)\b/.test(t)) return "executive";
+    if (/\b(director|head of|head)\b/.test(t)) return "director";
+    if (/\b(lead|staff|principal)\b/.test(t)) return "lead";
+    return "senior";
+  }
+  if (/\bmanager\b/.test(t)) return "manager";
+  if (/\b(associate)\b/.test(t)) return "associate";
+  if (/\b(mid)\b/.test(t)) return "mid";
+  return "unknown";
+}
+__name(inferSeniorityFromTitle, "inferSeniorityFromTitle");
 function normalizeJobSeniority(raw) {
   if (!raw) return null;
   const s = String(raw).trim();
