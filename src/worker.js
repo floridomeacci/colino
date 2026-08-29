@@ -39,6 +39,9 @@ var worker_default = {
       if (url.pathname === "/api/jobs") {
         return handleGetJobs(env);
       }
+      if (url.pathname === "/api/jobs/stream") {
+        return handleGetJobsStream(env);
+      }
       if (url.pathname === "/api/stats") {
         return handleGetStats(env);
       }
@@ -89,6 +92,39 @@ async function handleGetJobs(env) {
   return jsonResponse(slim);
 }
 __name(handleGetJobs, "handleGetJobs");
+async function handleGetJobsStream(env) {
+  const jobs = await getAtsDb(env);
+  const enc = new TextEncoder();
+  let i = 0;
+  const stream = new ReadableStream({
+    start(controller) {
+      function push() {
+        const CHUNK = 50;
+        for (let n = 0; n < CHUNK && i < jobs.length; n++, i++) {
+          const j = jobs[i];
+          const rest = { ...j };
+          if (rest.description) rest.description = rest.description.slice(0, 400);
+          controller.enqueue(enc.encode(JSON.stringify(rest) + "\n"));
+        }
+        if (i >= jobs.length) {
+          controller.close();
+        } else {
+          // Yield to the event loop so other requests aren't blocked.
+          setTimeout(push, 0);
+        }
+      }
+      push();
+    }
+  });
+  return new Response(stream, {
+    headers: {
+      "Content-Type": "application/x-ndjson",
+      "Cache-Control": "no-cache",
+      "X-Content-Type-Options": "nosniff"
+    }
+  });
+}
+__name(handleGetJobsStream, "handleGetJobsStream");
 async function handleGetJob(request, env) {
   try {
     const body = await readJsonBody(request);
@@ -933,9 +969,11 @@ async function getAtsDb(env) {
   if (!env || !env.JOBS_KV) return [];
   const list = await env.JOBS_KV.list({ prefix: "ats:" });
   const cutoff = Date.now() - RETENTION_S * 1000;
+  // Read all company keys in parallel.
+  const batches = await Promise.all(list.keys.map((k) => env.JOBS_KV.get(k.name, { type: "json" })));
   const all = [];
-  for (const k of list.keys) {
-    const jobs = (await env.JOBS_KV.get(k.name, { type: "json" })) || [];
+  for (const jobs of batches) {
+    if (!jobs) continue;
     for (const j of jobs) {
       if (!j.collected_at || j.collected_at >= cutoff) {
         if (!j.country) j.country = inferCountry(j.job_location);

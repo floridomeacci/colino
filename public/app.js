@@ -239,13 +239,47 @@ function syncSelectState(el) {
 
 async function loadJobs() {
   try {
-    const res = await fetch('/api/jobs');
-    const data = await res.json();
-    if (!Array.isArray(data)) throw new Error('Bad response');
-    allJobs = data;
-    populateFilters();
-    applyFilters();
-    updateStats();
+    const res = await fetch('/api/jobs/stream');
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    if (!res.body) throw new Error('Streaming not supported');
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let count = 0;
+    const received = [];
+    let renderTimer = null;
+
+    function flush() {
+      renderTimer = null;
+      if (!received.length) return;
+      allJobs.push(...received.splice(0));
+      populateFilters();
+      applyFilters();
+      updateStats();
+    }
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let nl;
+      while ((nl = buffer.indexOf('\n')) !== -1) {
+        const line = buffer.slice(0, nl).trim();
+        buffer = buffer.slice(nl + 1);
+        if (!line) continue;
+        try {
+          received.push(JSON.parse(line));
+          count++;
+        } catch (e) {}
+      }
+      // Throttle re-render: flush in batches as jobs arrive.
+      if (!renderTimer && received.length > 0) {
+        renderTimer = setTimeout(flush, 120);
+      }
+    }
+    if (renderTimer) { clearTimeout(renderTimer); renderTimer = null; }
+    flush();
   } catch (err) {
     feed.innerHTML = `<p class="loader" style="color:var(--negative)">Failed to load: ${esc(err.message)}</p>`;
   }
