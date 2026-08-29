@@ -984,7 +984,14 @@ async function extractPDFText(file) {
     try { pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js'; } catch (e) {}
   }
   try {
-    if (localStorage.getItem('fitlist_sidebar') === '1') app.classList.add('sidebar-collapsed');
+    const saved = localStorage.getItem('fitlist_sidebar');
+    const isMobile = window.matchMedia('(max-width: 720px)').matches;
+    // On mobile, default to collapsed (slide-over hidden) unless user explicitly opened it.
+    if (saved !== null) {
+      if (saved === '1') app.classList.add('sidebar-collapsed');
+    } else if (isMobile) {
+      app.classList.add('sidebar-collapsed');
+    }
   } catch (e) {}
   loadChatState();
   loadVotes();
