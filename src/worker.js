@@ -521,15 +521,35 @@ async function handleSearch(request, env) {
     } else {
       scored = keywordRank(query, db);
     }
-    scored = applyVotes(scored, likes, dislikes);
-    scored = applyLocationFilter(scored, locationTags);
-    scored = applyRelevanceGate(scored, tags);
-    return jsonResponse({ jobs: scored.slice(0, 500), total: scored.length });
+
+    // Stage 1: lexical / term-overlap retrieval.
+    let mode = "lexical";
+    let gated = applyRelevanceGate(scored, tags);
+    // Stage 2: fallback to embedding-only retrieval with a semantic threshold.
+    if (!gated.length) {
+      gated = applySemanticThreshold(scored);
+      mode = "semantic_fallback";
+    }
+    // Stage 3: apply preferences only after the relevance threshold.
+    gated = applyVotes(gated, likes, dislikes);
+    gated = applyLocationFilter(gated, locationTags);
+    return jsonResponse({ jobs: gated.slice(0, 500), total: gated.length, search_mode: mode });
   } catch (err) {
     return jsonResponse({ error: err && err.message ? err.message : String(err) }, err.status || 500);
   }
 }
 __name(handleSearch, "handleSearch");
+// Embedding-only retrieval with a minimum semantic-relevance threshold.
+function applySemanticThreshold(scored) {
+  if (!scored.length) return scored;
+  const top = scored[0].similarity != null ? scored[0].similarity : (scored[0].score / 100);
+  const floor = Math.max(top * 0.85, 0.30);
+  return scored.filter((j) => {
+    const sim = j.similarity != null ? j.similarity : (j.score / 100);
+    return sim >= floor;
+  });
+}
+__name(applySemanticThreshold, "applySemanticThreshold");
 const RELEVANCE_STOP = new Set(["the", "a", "an", "and", "or", "for", "in", "at", "on", "of", "to", "with", "jobs", "job", "roles", "role", "work", "position", "positions", "looking", "look", "find", "show", "search", "remote", "i", "me", "my", "we", "you", "our"]);
 function applyRelevanceGate(scored, tags) {
   if (!scored.length) return scored;

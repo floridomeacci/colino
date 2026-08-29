@@ -192,8 +192,9 @@
           returned_count: page.length,
           next_cursor: offset + limit < matched ? offset + limit : null,
           database_total: res.total ?? matched,
+          search_mode: res.search_mode || null,
           jobs: page.map(summary)
-        });
+        }, { search_mode: res.search_mode || null });
       })
   );
 
