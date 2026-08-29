@@ -880,7 +880,9 @@ async function processCV(file) {
       if (p.skills && p.skills.length) lines.push('Skills: ' + p.skills.slice(0, 12).join(', '));
       if (p.domains && p.domains.length) lines.push('Domains: ' + p.domains.slice(0, 8).join(', '));
       if (p.industries && p.industries.length) lines.push('Industries: ' + p.industries.slice(0, 8).join(', '));
-      if (p.locations && p.locations.length) lines.push('Locations: ' + p.locations.slice(0, 5).join(', '));
+      if (p.current_location) lines.push('Current location: ' + p.current_location);
+      if (p.preferred_locations && p.preferred_locations.length) lines.push('Preferred locations: ' + p.preferred_locations.slice(0, 5).join(', '));
+      if (p.remote_preference) lines.push('Remote preference: ' + p.remote_preference);
       if (p.seniority) lines.push('Seniority: ' + p.seniority);
       appendNotes(`## ${file.name}\n${lines.join('\n')}`);
 
@@ -892,14 +894,16 @@ async function processCV(file) {
       const profileTags = [];
       if (p.roles && p.roles[0]) profileTags.push(p.roles[0]);
       if (p.seniority) profileTags.push(p.seniority);
-      if (p.locations && p.locations.length) profileTags.push(...p.locations.slice(0, 2));
+      if (p.current_location) profileTags.push(p.current_location);
       if (p.industries && p.industries.length) profileTags.push(...p.industries.slice(0, 2));
       if (p.skills && p.skills.length) profileTags.push(...p.skills.slice(0, 5));
       clearTags();
       addTags(profileTags);
 
       const missing = (p.missing || []).filter(Boolean);
-      if (missing.length) {
+      // Also treat low-confidence location as a gap worth confirming.
+      const locConfident = (p.location_confidence == null) || (p.location_confidence >= 0.5) || (p.preferred_locations && p.preferred_locations.length);
+      if (missing.length || !locConfident) {
         askProfileFollowUps(missing, data.suggestions || []);
       } else {
         showRoleSuggestions(data.suggestions || []);
@@ -914,7 +918,7 @@ function buildProfileSummary(p) {
   const parts = [];
   if (p.roles && p.roles.length) parts.push(`role: ${p.roles[0]}`);
   if (p.seniority) parts.push(`seniority: ${p.seniority}`);
-  if (p.locations && p.locations.length) parts.push(`location: ${p.locations.slice(0, 2).join(', ')}`);
+  if (p.current_location) parts.push(`location: ${p.current_location}`);
   if (p.industries && p.industries.length) parts.push(`industry: ${p.industries.slice(0, 2).join(', ')}`);
   if (p.skills && p.skills.length) parts.push(`skills: ${p.skills.slice(0, 5).join(', ')}`);
   if (p.future_roles && p.future_roles.length) parts.push(`could grow into: ${p.future_roles.slice(0, 3).join(', ')}`);

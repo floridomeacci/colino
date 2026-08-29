@@ -759,8 +759,7 @@ async function handleMatchProfile(request, env) {
       ...(profile.future_roles || []),
       ...(profile.skills || []).slice(0, 10),
       ...(profile.domains || []),
-      ...(profile.industries || []),
-      ...(profile.locations || [])
+      ...(profile.industries || [])
     ].join(" ");
     let scored;
     if (env.AI) {
@@ -769,7 +768,13 @@ async function handleMatchProfile(request, env) {
     } else {
       scored = keywordRank(query, db);
     }
-    scored = applyLocationFilter(scored, (profile.locations || []).filter(isLocationTag));
+    // Tiered location preference (re-rank, not filter).
+    scored = scored.map((j) => {
+      const { bonus, tier } = locationTier(profile, j);
+      return { ...j, score: j.score + bonus, location_tier: tier };
+    }).sort((a, b) => b.score - a.score);
+    // Demote clearly irrelevant roles so preference bonuses don't rescue them.
+    scored = applyRelevanceGate(scored, query.split(/\s+/).filter(Boolean));
     const jobs = scored.slice(0, limit).map((j) => ({
       job_id: j.job_posting_id || jobId(j.url),
       job_title: j.job_title,
@@ -799,8 +804,10 @@ function matchReasons(job, profile) {
   for (const skill of (profile.skills || []).slice(0, 12)) {
     if (skill && hay.includes(skill.toLowerCase())) reasons.push(`Matches skill: ${skill}`);
   }
-  for (const loc of (profile.locations || [])) {
-    const l = loc.toLowerCase();
+  const locs = [...(profile.preferred_locations || []), ...(profile.current_location ? [profile.current_location] : [])];
+  for (const loc of locs) {
+    const l = String(loc).toLowerCase();
+    if (!l || l === "remote") continue;
     const jl = `${job.job_location || ""} ${job.country || ""}`.toLowerCase();
     if (jl.includes(l)) reasons.push(`Location match: ${loc}`);
   }
@@ -1698,9 +1705,13 @@ async function scoreWithEmbeddings(cvText, profile, jobs, env) {
     const kwNorm = scoreJob(jobs[i], profile) / maxKw;
     const penalty = seniorityPenalty(profile.seniority, jobs[i].job_seniority_level);
     const recency = recencyBonus(jobs[i].job_posted_date);
-    const locBonus = locationBonus(profile.locations, jobs[i]);
-    const score = Math.round(cos * 100 + kwNorm * 40 + recency + locBonus - penalty);
-    scored.push({ ...jobs[i], score, similarity: +cos.toFixed(4) });
+    const { bonus: locBonus, tier } = locationTier(profile, jobs[i]);
+    // Location only re-ranks jobs that already have core relevance; it never rescues
+    // an irrelevant role. Apply the preference bonus scaled to keyword relevance.
+    const coreRelevant = (cos > 0.55) || (kwNorm > 0.05);
+    const appliedLoc = coreRelevant ? locBonus : Math.min(locBonus, 0);
+    const score = Math.round(cos * 100 + kwNorm * 40 + recency + appliedLoc - penalty);
+    scored.push({ ...jobs[i], score, similarity: +cos.toFixed(4), location_tier: tier });
   }
   scored.sort((a, b) => b.score - a.score);
   return scored;
@@ -1727,6 +1738,57 @@ function locationBonus(locations, job) {
   return matched ? 15 : -10;
 }
 __name(locationBonus, "locationBonus");
+// Tiered location scoring (preference, not a filter). Returns { bonus, tier }.
+function locationTier(profile, job) {
+  const loc = `${job.job_location || ""}`.toLowerCase();
+  const country = `${job.country || ""}`.toLowerCase();
+  const wp = `${job.workplace_type || ""}`.toLowerCase();
+  const hay = `${loc} ${country} ${wp}`;
+  const isRemote = /remote/i.test(hay);
+  const prefs = (profile.preferred_locations || []).map((s) => String(s).toLowerCase()).filter(Boolean);
+  const current = profile.current_location ? String(profile.current_location).toLowerCase() : null;
+  const locs = [...prefs, ...(current ? [current] : [])];
+
+  // No location info on either side: neutral.
+  if (!locs.length) return { bonus: 0, tier: "unknown" };
+  if (!loc && !country && !isRemote) return { bonus: 0, tier: "unknown" };
+
+  // Exact preferred city match.
+  for (const l of locs) {
+    if (l !== "remote" && l.length > 2 && loc.includes(l)) {
+      return { bonus: 15, tier: "exact_city" };
+    }
+  }
+
+  // Country / region match (also catches "Remote EU" style).
+  for (const l of locs) {
+    if (l === "remote") continue;
+    // Match city against a city the job lists, or country against country.
+    if (country && country.includes(l)) return { bonus: 4, tier: "country" };
+    if (loc && loc.includes(l)) return { bonus: 4, tier: "region" };
+    // "remote eu" -> job is remote and in an EU country
+    if (l.startsWith("remote ") && isRemote && country && l.slice(7) && (country.includes(l.slice(7)) || isEuCountry(country))) {
+      return { bonus: 10, tier: "compatible_remote" };
+    }
+  }
+
+  // Compatible remote: candidate wants remote and job is remote.
+  if (isRemote && (profile.remote_preference === "remote" || prefs.some((l) => l === "remote"))) {
+    return { bonus: 12, tier: "compatible_remote" };
+  }
+
+  // Candidate willing to relocate: no penalty.
+  if (profile.willing_to_relocate) return { bonus: 0, tier: "relocate" };
+
+  // Explicitly incompatible.
+  return { bonus: -10, tier: "incompatible" };
+}
+__name(locationTier, "locationTier");
+function isEuCountry(country) {
+  const eu = new Set(["austria", "belgium", "bulgaria", "croatia", "cyprus", "czech republic", "czechia", "denmark", "estonia", "finland", "france", "germany", "greece", "hungary", "ireland", "italy", "latvia", "lithuania", "luxembourg", "malta", "netherlands", "poland", "portugal", "romania", "slovakia", "slovenia", "spain", "sweden"]);
+  return eu.has(String(country).toLowerCase());
+}
+__name(isEuCountry, "isEuCountry");
 async function analyzeCV(text, env) {
   const truncated = text.slice(0, 8e3);
   const prompt = `Analyze this CV/resume and extract structured information for job matching. Return ONLY valid JSON (no markdown code fences, no explanation) with these exact keys:
@@ -1736,8 +1798,13 @@ async function analyzeCV(text, env) {
 - "domains": array of industry/domain keywords (e.g. "fintech", "healthcare", "AI", "design", "advertising")
 - "industries": array of the specific industries this person has worked in and is best suited for (e.g. "advertising", "creative agency", "consumer goods", "tech")
 - "locations": array of locations this person is based in or willing to work (e.g. "Amsterdam", "Netherlands", "Remote"). Infer their current city/country from the CV if present; otherwise leave empty.
+- "current_location": the city where this person currently lives or is based, as a single string (e.g. "Amsterdam"). Empty if not stated in the CV.
+- "preferred_locations": array of locations this person wants to work in (e.g. "Amsterdam", "Rotterdam", "Remote EU"). Empty if not stated.
+- "remote_preference": one of "remote", "hybrid", "onsite", or null, reflecting whether they want remote work.
+- "willing_to_relocate": boolean, true only if the CV signals a willingness to move for work.
+- "location_confidence": a number from 0 to 1, how confident you are in the extracted location (0 if no location was found).
 - "seniority": the candidate's seniority level, exactly one of: "internship", "entry", "associate", "mid-senior", "senior", "lead", "director", "executive"
-- "missing": array of field names (from: "skills", "roles", "future_roles", "industries", "locations", "seniority") that are missing, incomplete, or low-confidence based on the CV. Only list fields you could not determine with confidence. If everything is clear, return an empty array.
+- "missing": array of field names (from: "skills", "roles", "future_roles", "industries", "preferred_locations", "seniority") that are missing, incomplete, or low-confidence based on the CV. Only list fields you could not determine with confidence. If everything is clear, return an empty array.
 - "companies": array of 100 specific employer/company names this person would likely want to work at NEXT. Suggest NEW companies similar to the ones in their CV and relevant to their skills/industry. Do NOT repeat companies already mentioned in the CV. Focus on real companies that hire for their role and domain (e.g. "Spotify", "Booking.com", "Adyen", "Figma", "TomTom").
 
 CV TEXT:
@@ -1850,6 +1917,11 @@ function normalizeProfile(p) {
     domains: toStrArray(p && p.domains),
     industries: toStrArray(p && p.industries),
     locations: toStrArray(p && p.locations),
+    current_location: p && p.current_location ? String(p.current_location).trim() : null,
+    preferred_locations: toStrArray(p && p.preferred_locations),
+    remote_preference: p && p.remote_preference ? String(p.remote_preference).toLowerCase() : null,
+    willing_to_relocate: !!p && p.willing_to_relocate === true,
+    location_confidence: p && typeof p.location_confidence === "number" ? p.location_confidence : (p && p.locations && p.locations.length ? 0.8 : 0),
     seniority: normalizeSeniority(p && p.seniority),
     missing: toStrArray(p && p.missing),
     companies: toStrArray(p && p.companies)
