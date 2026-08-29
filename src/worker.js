@@ -1739,6 +1739,8 @@ function locationBonus(locations, job) {
 }
 __name(locationBonus, "locationBonus");
 // Tiered location scoring (preference, not a filter). Returns { bonus, tier }.
+// Bonuses are deliberately modest: location re-ranks qualified results but never
+// dominates core relevance (a 25-point swing was too strong).
 function locationTier(profile, job) {
   const loc = `${job.job_location || ""}`.toLowerCase();
   const country = `${job.country || ""}`.toLowerCase();
@@ -1756,7 +1758,7 @@ function locationTier(profile, job) {
   // Exact preferred city match.
   for (const l of locs) {
     if (l !== "remote" && l.length > 2 && loc.includes(l)) {
-      return { bonus: 15, tier: "exact_city" };
+      return { bonus: 10, tier: "exact_city" };
     }
   }
 
@@ -1764,24 +1766,24 @@ function locationTier(profile, job) {
   for (const l of locs) {
     if (l === "remote") continue;
     // Match city against a city the job lists, or country against country.
-    if (country && country.includes(l)) return { bonus: 4, tier: "country" };
-    if (loc && loc.includes(l)) return { bonus: 4, tier: "region" };
+    if (country && country.includes(l)) return { bonus: 3, tier: "country" };
+    if (loc && loc.includes(l)) return { bonus: 3, tier: "region" };
     // "remote eu" -> job is remote and in an EU country
     if (l.startsWith("remote ") && isRemote && country && l.slice(7) && (country.includes(l.slice(7)) || isEuCountry(country))) {
-      return { bonus: 10, tier: "compatible_remote" };
+      return { bonus: 7, tier: "compatible_remote" };
     }
   }
 
   // Compatible remote: candidate wants remote and job is remote.
   if (isRemote && (profile.remote_preference === "remote" || prefs.some((l) => l === "remote"))) {
-    return { bonus: 12, tier: "compatible_remote" };
+    return { bonus: 7, tier: "compatible_remote" };
   }
 
   // Candidate willing to relocate: no penalty.
   if (profile.willing_to_relocate) return { bonus: 0, tier: "relocate" };
 
   // Explicitly incompatible.
-  return { bonus: -10, tier: "incompatible" };
+  return { bonus: -5, tier: "incompatible" };
 }
 __name(locationTier, "locationTier");
 function isEuCountry(country) {
