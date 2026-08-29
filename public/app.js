@@ -111,11 +111,10 @@ function clearTags() {
 
 let semanticTimer = null;
 function runSemanticSearch() {
-  // Re-render immediately with whatever ordering we already have.
-  applyFilters();
-  updateStats();
   if (!activeTags.length) {
     semanticScores = null;
+    applyFilters();
+    updateStats();
     return;
   }
   clearTimeout(semanticTimer);
@@ -131,12 +130,12 @@ function runSemanticSearch() {
       if (Array.isArray(data.jobs)) {
         semanticScores = {};
         for (const j of data.jobs) semanticScores[j.url] = j.score;
-        applyFilters();
-        updateStats();
       }
     } catch (e) {
       semanticScores = null;
     }
+    applyFilters();
+    updateStats();
   }, 0);
 }
 
