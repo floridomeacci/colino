@@ -69,6 +69,9 @@ var worker_default = {
       if (url.pathname === "/api/match-profile" && request.method === "POST") {
         return handleMatchProfile(request, env);
       }
+      if (url.pathname === "/api/job" && request.method === "POST") {
+        return handleGetJob(request, env);
+      }
       return env.ASSETS.fetch(request);
     } catch (err) {
       return jsonResponse({ error: err && err.message ? err.message : String(err) }, 500);
@@ -77,9 +80,30 @@ var worker_default = {
 };
 async function handleGetJobs(env) {
   const jobs = await getAtsDb(env);
-  return jsonResponse(jobs);
+  // Slim list payload: truncate descriptions (full text is fetched on demand).
+  const slim = jobs.map((j) => {
+    const rest = { ...j };
+    if (rest.description) rest.description = rest.description.slice(0, 400);
+    return rest;
+  });
+  return jsonResponse(slim);
 }
 __name(handleGetJobs, "handleGetJobs");
+async function handleGetJob(request, env) {
+  try {
+    const body = await readJsonBody(request);
+    const jobId_ = sanitizeText(body.job_id, 200);
+    const url = sanitizeText(body.url, 500);
+    if (!jobId_ && !url) return jsonResponse({ error: "job_id or url required" }, 400);
+    const jobs = await getAtsDb(env);
+    const job = jobs.find((j) => (jobId_ && j.job_posting_id === jobId_) || (url && j.url === url));
+    if (!job) return jsonResponse({ error: "Job not found" }, 404);
+    return jsonResponse(job);
+  } catch (err) {
+    return jsonResponse({ error: err && err.message ? err.message : String(err) }, err.status || 500);
+  }
+}
+__name(handleGetJob, "handleGetJob");
 async function handleGetStats(env) {
   const jobs = await getAtsDb(env);
   const companies = new Set(jobs.map((j) => j.company_name).filter(Boolean));

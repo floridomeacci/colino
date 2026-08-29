@@ -324,6 +324,8 @@ function applyFilters() {
   renderLeadCta();
 }
 
+let renderToken = 0;
+
 function renderJobs() {
   if (!filteredJobs.length) {
     feed.innerHTML = '';
@@ -332,55 +334,85 @@ function renderJobs() {
 
   const start = (currentPage - 1) * PAGE_SIZE;
   const pageJobs = filteredJobs.slice(start, start + PAGE_SIZE);
+  const token = ++renderToken;
 
-  feed.innerHTML = pageJobs.map((job, i) => {
-    const initial = (job.company_name || '?')[0].toUpperCase();
-    const avatarHtml = job.company_logo
-      ? `<img class="job-logo" src="${esc(job.company_logo)}" alt="" loading="lazy" onerror="this.outerHTML='<span class=\\'job-initial\\'>${esc(initial)}</span>'">`
-      : `<span class="job-initial">${esc(initial)}</span>`;
+  feed.innerHTML = '';
 
-    const tags = [];
-    if (cvMatchUrls.has(job.url)) tags.push(`<span class="tag tag-match">★ Match ${cvMatchScores[job.url]}</span>`);
-    if (job.base_salary) tags.push(`<span class="tag tag-salary">${formatSalary(job.base_salary)}</span>`);
-    if (job.is_easy_apply) tags.push('<span class="tag tag-easy">Easy Apply</span>');
-    if (job.workplace_type) tags.push(`<span class="tag tag-workplace">${esc(job.workplace_type)}</span>`);
-    if (job.job_seniority_level && job.job_seniority_level !== 'Not Applicable')
-      tags.push(`<span class="tag tag-seniority">${esc(job.job_seniority_level)}</span>`);
+  // Progressive render: append jobs in small chunks so the first rows show immediately.
+  const CHUNK = 12;
+  let i = 0;
 
-    const desc = job.description ? `\n          <p class="job-desc">${esc(truncate(job.description, 320))}</p>` : '';
+  function appendChunk() {
+    if (token !== renderToken) return; // superseded by a newer render
+    const end = Math.min(i + CHUNK, pageJobs.length);
+    const frag = document.createDocumentFragment();
+    for (; i < end; i++) {
+      frag.appendChild(buildJobNode(pageJobs[i], i));
+    }
+    feed.appendChild(frag);
+    bindVotes(frag);
+    if (i < pageJobs.length) {
+      requestAnimationFrame(appendChunk);
+    } else {
+      observeJobs();
+    }
+  }
 
-    const id = jobId(job.url);
-    const liked = likedUrls.has(job.url);
-    const disliked = dislikedUrls.has(job.url);
+  appendChunk();
+}
 
-    // Stagger only first 30 items
-    const stagger = i < 30 ? `style="--i:${i}"` : 'style="--i:0"';
+function buildJobNode(job, i) {
+  const initial = (job.company_name || '?')[0].toUpperCase();
+  const avatarHtml = job.company_logo
+    ? `<img class="job-logo" src="${esc(job.company_logo)}" alt="" loading="lazy" onerror="this.outerHTML='<span class=\\'job-initial\\'>${esc(initial)}</span>'">`
+    : `<span class="job-initial">${esc(initial)}</span>`;
 
-    return `
-      <a href="${esc(job.url || '#')}" target="_blank" rel="noopener noreferrer" class="job ${pinnedIds.has(id) ? 'job-pinned' : ''} ${disliked ? 'job-disliked' : ''}" ${stagger}>
-        ${avatarHtml}
-        <div class="job-body">
-          <div class="job-title">${esc(job.job_title || 'Untitled')}${isJobNew(job) ? ' <span class="tag tag-new">New</span>' : ''}</div>
-          <div class="job-company">${esc(job.company_name || 'Unknown')}</div>
-          <div class="job-meta">
-            <span>${esc(job.job_location || '—')}</span>
-            <span>${esc(job.job_employment_type || '—')}</span>
-            ${job.job_posted_time ? `<span>${esc(job.job_posted_time)}</span>` : ''}
-          </div>${desc}
-        </div>
-        <div class="job-aside">
-          <div class="vote-row">
-            <button class="vote-btn vote-like ${liked ? 'active' : ''}" data-url="${esc(job.url)}" aria-label="Like" title="Like">▲</button>
-            <button class="vote-btn vote-dislike ${disliked ? 'active' : ''}" data-url="${esc(job.url)}" aria-label="Dislike" title="Dislike">▼</button>
-          </div>
-          ${tags.join('')}
-          ${job.job_num_applicants != null ? `<span class="job-applicants">${job.job_num_applicants} applicants</span>` : ''}
-        </div>
-      </a>`;
-  }).join('');
+  const tags = [];
+  if (cvMatchUrls.has(job.url)) tags.push(`<span class="tag tag-match">★ Match ${cvMatchScores[job.url]}</span>`);
+  if (job.base_salary) tags.push(`<span class="tag tag-salary">${formatSalary(job.base_salary)}</span>`);
+  if (job.is_easy_apply) tags.push('<span class="tag tag-easy">Easy Apply</span>');
+  if (job.workplace_type) tags.push(`<span class="tag tag-workplace">${esc(job.workplace_type)}</span>`);
+  if (job.job_seniority_level && job.job_seniority_level !== 'Not Applicable')
+    tags.push(`<span class="tag tag-seniority">${esc(job.job_seniority_level)}</span>`);
 
-  // Vote toggling (delegated, stops link navigation)
-  feed.querySelectorAll('.vote-like').forEach(btn => {
+  const desc = job.description ? `\n          <p class="job-desc">${esc(truncate(job.description, 320))}</p>` : '';
+
+  const id = jobId(job.url);
+  const liked = likedUrls.has(job.url);
+  const disliked = dislikedUrls.has(job.url);
+
+  const stagger = i < 30 ? `style="--i:${i}"` : 'style="--i:0"';
+
+  const el = document.createElement('a');
+  el.href = job.url || '#';
+  el.target = '_blank';
+  el.rel = 'noopener noreferrer';
+  el.className = `job ${pinnedIds.has(id) ? 'job-pinned' : ''} ${disliked ? 'job-disliked' : ''}`;
+  el.setAttribute('style', stagger);
+  el.innerHTML = `
+    ${avatarHtml}
+    <div class="job-body">
+      <div class="job-title">${esc(job.job_title || 'Untitled')}${isJobNew(job) ? ' <span class="tag tag-new">New</span>' : ''}</div>
+      <div class="job-company">${esc(job.company_name || 'Unknown')}</div>
+      <div class="job-meta">
+        <span>${esc(job.job_location || '—')}</span>
+        <span>${esc(job.job_employment_type || '—')}</span>
+        ${job.job_posted_time ? `<span>${esc(job.job_posted_time)}</span>` : ''}
+      </div>${desc}
+    </div>
+    <div class="job-aside">
+      <div class="vote-row">
+        <button class="vote-btn vote-like ${liked ? 'active' : ''}" data-url="${esc(job.url)}" aria-label="Like" title="Like">▲</button>
+        <button class="vote-btn vote-dislike ${disliked ? 'active' : ''}" data-url="${esc(job.url)}" aria-label="Dislike" title="Dislike">▼</button>
+      </div>
+      ${tags.join('')}
+      ${job.job_num_applicants != null ? `<span class="job-applicants">${job.job_num_applicants} applicants</span>` : ''}
+    </div>`;
+  return el;
+}
+
+function bindVotes(container) {
+  container.querySelectorAll('.vote-like').forEach(btn => {
     btn.addEventListener('click', (e) => {
       e.preventDefault();
       e.stopPropagation();
@@ -389,7 +421,7 @@ function renderJobs() {
       renderJobs();
     });
   });
-  feed.querySelectorAll('.vote-dislike').forEach(btn => {
+  container.querySelectorAll('.vote-dislike').forEach(btn => {
     btn.addEventListener('click', (e) => {
       e.preventDefault();
       e.stopPropagation();
@@ -398,9 +430,6 @@ function renderJobs() {
       renderJobs();
     });
   });
-
-  // Scroll-triggered reveals via IntersectionObserver
-  observeJobs();
 }
 
 function renderLeadCta() {

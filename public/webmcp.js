@@ -184,13 +184,15 @@
     },
     async (input) =>
       safe(async () => {
-        const jobs = await API("/api/jobs");
         const id = clean(input.job_id, 200);
         const url = clean(input.source_url, 500);
-        let job;
-        if (id) job = jobs.find((j) => j.job_posting_id === id);
-        if (!job && url) job = jobs.find((j) => j.url === url);
-        if (!job) return fail("JOB_NOT_FOUND", "No job matched that identifier.");
+        if (!id && !url) return fail("INVALID_INPUT", "job_id or source_url is required");
+        const job = await API("/api/job", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(id ? { job_id: id } : { url })
+        });
+        if (job.error) return fail("JOB_NOT_FOUND", job.error);
         return ok({
           ...summary(job),
           description_text: stripHtml(job.description),
