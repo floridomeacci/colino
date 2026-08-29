@@ -1,0 +1,15 @@
+{
+  "queries": [
+    { "query": "creative technologist amsterdam", "notes": "Creative/design-technology roles in Amsterdam" },
+    { "query": "senior product designer remote eu", "notes": "Senior product design, remote within EU" },
+    { "query": "junior motion designer", "notes": "Entry-level motion design" },
+    { "query": "ai engineer willing to relocate", "notes": "AI engineering, open to moving" },
+    { "query": "design leader hybrid rotterdam", "notes": "Design leadership, hybrid in Rotterdam" },
+    { "query": "machine learning engineer", "notes": "ML engineering" },
+    { "query": "product manager fintech", "notes": "Product management in fintech" },
+    { "query": "frontend developer react", "notes": "Frontend engineering with React" },
+    { "query": "data analyst", "notes": "Data analysis" },
+    { "query": "ux researcher", "notes": "UX research" }
+  ],
+  "metrics": ["precision_at_5", "ndcg_at_10", "no_result_rate", "irrelevant_rate", "location_satisfaction", "company_diversity"]
+}

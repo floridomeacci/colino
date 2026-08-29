@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "wrangler dev --env-file .env",
     "deploy": "wrangler deploy",
-    "collect": "node collectors/index.mjs"
+    "collect": "node collectors/index.mjs",
+    "eval": "node collectors/eval.mjs"
   },
   "keywords": [],
   "author": "",

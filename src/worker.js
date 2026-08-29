@@ -614,9 +614,13 @@ __name(keywordRank, "keywordRank");
 // Hybrid retrieval + weighted relevance + preference rerank.
 // Returns an array of jobs with { score, relevance, reasons, gaps, location_tier }.
 async function hybridRank(env, intent, jobs, opts = {}) {
-  const { likes, dislikes } = opts;
-  const result = [];
+  const { likes, dislikes, rerank = true } = opts;
   const MIN_RELEVANCE = opts.minRelevance != null ? opts.minRelevance : 0.42;
+
+  // Enrich then deduplicate before scoring so one company can't dominate.
+  const enriched = jobs.map(enrichJob);
+  const deduped = dedupJobs(enriched, intent);
+  const result = [];
 
   // Embeddings for separate fields (title + description).
   let qTitleVec = null, qDescVec = null, titleVecs = [], descVecs = [];
@@ -626,15 +630,15 @@ async function hybridRank(env, intent, jobs, opts = {}) {
       const qVecs = await embedTexts(env, [qText.slice(0, 2000)]);
       qTitleVec = qVecs[0];
       qDescVec = qVecs[0];
-      titleVecs = await getFieldEmbeddings(env, jobs, "title", jobTitleText);
-      descVecs = await getFieldEmbeddings(env, jobs, "desc", jobDescText);
+      titleVecs = await getFieldEmbeddings(env, deduped, "title", jobTitleText);
+      descVecs = await getFieldEmbeddings(env, deduped, "desc", jobDescText);
     } catch (e) {
       qTitleVec = null; qDescVec = null;
     }
   }
 
-  for (let i = 0; i < jobs.length; i++) {
-    const job = jobs[i];
+  for (let i = 0; i < deduped.length; i++) {
+    const job = deduped[i];
     const h = hybridScore(job, intent, titleVecs[i], descVecs[i], qTitleVec, qDescVec);
     if (h === -1) continue; // excluded
     if (h.base < MIN_RELEVANCE) continue;
@@ -661,9 +665,114 @@ async function hybridRank(env, intent, jobs, opts = {}) {
   }
 
   result.sort((a, b) => b.score - a.score);
+
+  // Second-stage LLM rerank of the top candidates (structured fit + reasons).
+  if (rerank && result.length > 1) {
+    return rerankWithLLM(env, intent, result);
+  }
   return result;
 }
 __name(hybridRank, "hybridRank");
+// ─── Deduplication (collapse reposts, agency mirrors, multi-location dupes) ───
+function titleKey(t) {
+  return String(t || "").toLowerCase().replace(/[^a-z0-9+#]+/g, " ").replace(/\s+/g, " ").trim();
+}
+__name(titleKey, "titleKey");
+function dedupJobs(jobs, intent) {
+  // Group by company + normalized title; merge locations, keep best-scored entry.
+  const groups = new Map();
+  for (const j of jobs) {
+    const key = `${normalizeCompanyName(j.company_name)}::${titleKey(j.job_title)}`;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(j);
+  }
+  const out = [];
+  for (const [key, items] of groups) {
+    if (items.length === 1) { out.push(items[0]); continue; }
+    // Multiple listings for the same role at one company: merge locations and keep the best.
+    const merged = { ...items[0] };
+    const locs = new Set();
+    for (const it of items) if (it.job_location) locs.add(it.job_location);
+    merged.job_location = [...locs].join(" | ");
+    merged._dup_count = items.length;
+    // Prefer the entry with the best location tier for the intent.
+    let best = items[0];
+    let bestTier = 99;
+    for (const it of items) {
+      const { tier } = locationTier(intent, it);
+      const rank = { exact_city: 0, compatible_remote: 1, country: 2, region: 2, unknown: 3, relocate: 3, incompatible: 4 }[tier] ?? 3;
+      if (rank < bestTier) { bestTier = rank; best = it; }
+    }
+    merged.job_location = best.job_location;
+    merged.location_tier = best.location_tier;
+    merged.job_posting_id = best.job_posting_id;
+    out.push(merged);
+  }
+  return out;
+}
+__name(dedupJobs, "dedupJobs");
+// ─── Second-stage cross-encoder reranker ───
+async function rerankWithLLM(env, intent, candidates) {
+  const top = candidates.slice(0, 30);
+  if (!top.length) return candidates;
+  const rows = top.map((j, i) => `${i} | ${j.job_title} | ${j.company_name} | ${j.job_location || ""} | ${j.job_seniority || "unknown"}`).join("\n");
+  const system = `You are a job relevance reranker. Given a candidate's structured intent and a list of jobs, score each job's fit. Return ONLY a JSON object, no markdown, shaped as:
+{"results":[{"idx":0,"role_fit":0.88,"skills_fit":0.81,"seniority_fit":0.72,"location_fit":1,"overall":0.84,"reasons":["..."],"gaps":["..."]}]}
+Score 0-1. "idx" must match the numeric index in the job list. Keep reasons and gaps short (max 3 each).`;
+  const prompt = `Intent:\n${JSON.stringify({ target_roles: intent.target_roles, related_roles: intent.related_roles, skills: intent.skills, seniority: intent.seniority, preferred_locations: intent.preferred_locations, exclude: intent.exclude })}\n\nJobs:\n${rows}`;
+  let parsed;
+  try {
+    const raw = await llmChat(env, system, prompt, 2500);
+    parsed = parseChatJson(raw);
+  } catch (e) {
+    parsed = null;
+  }
+  if (!parsed || !Array.isArray(parsed.results)) return candidates;
+  const byIdx = new Map(parsed.results.map((r) => [Number(r.idx), r]));
+  for (let i = 0; i < candidates.length; i++) {
+    const r = byIdx.get(i);
+    if (r) {
+      candidates[i].rerank = {
+        role_fit: r.role_fit, skills_fit: r.skills_fit, seniority_fit: r.seniority_fit,
+        location_fit: r.location_fit, overall: r.overall, reasons: r.reasons || [], gaps: r.gaps || []
+      };
+      candidates[i].score = Math.round((r.overall ?? candidates[i].relevance) * 100);
+    }
+  }
+  candidates.sort((a, b) => b.score - a.score);
+  return candidates;
+}
+__name(rerankWithLLM, "rerankWithLLM");
+// ─── Job-data enrichment (remote regions, work authorization, canonical location) ───
+function enrichJob(j) {
+  const loc = String(j.job_location || "").toLowerCase();
+  const country = String(j.country || "").toLowerCase();
+  const isRemote = /remote/i.test(loc) || /remote/i.test(j.workplace_type || "");
+  j.workplace_type = j.workplace_type || (isRemote ? "Remote" : null);
+  if (isRemote) {
+    // Detect remote geographic restrictions from the location text.
+    j.remote_regions = [];
+    for (const [region, test] of [
+      ["EU", /(europe|eu|emea)/i],
+      ["UK", /(uk|united kingdom)/i],
+      ["US", /(us|usa|united states|america)/i],
+      ["APAC", /(apac|asia pacific)/i],
+      ["Worldwide", /(worldwide|anywhere|global)/i]
+    ]) {
+      if (test.test(j.job_location || "")) j.remote_regions.push(region);
+    }
+    if (!j.remote_regions.length) j.remote_regions = ["Global"];
+  }
+  // Canonical city/country.
+  if (country) j.canonical_country = country;
+  else if (loc) {
+    const guess = inferCountry(j.job_location);
+    if (guess) j.canonical_country = guess.toLowerCase();
+  }
+  j.is_active = j.is_active !== false;
+  return j;
+}
+__name(enrichJob, "enrichJob");
 async function handleLeads(request, env) {
   try {
     const body = await readJsonBody(request);
@@ -816,10 +925,14 @@ async function handleMatchProfile(request, env) {
       posted_at: j.job_posted_date,
       is_active: j.is_active !== false,
       last_verified_at: j.last_verified_at || null,
+      workplace_type: j.workplace_type || null,
+      remote_regions: j.remote_regions || null,
+      canonical_country: j.canonical_country || null,
       match_score: j.score,
-      relevance: +j.relevance.toFixed(3),
-      match_reasons: matchReasons(j, profile),
-      gaps: matchGaps(j, profile)
+      relevance: j.relevance != null ? +j.relevance.toFixed(3) : null,
+      match_reasons: j.rerank ? (j.rerank.reasons || []) : matchReasons(j, profile),
+      gaps: j.rerank ? (j.rerank.gaps || []) : matchGaps(j, profile),
+      rerank: j.rerank || null
     }));
     return jsonResponse({ matched_count: jobs.length, jobs });
   } catch (err) {
