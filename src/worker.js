@@ -60,6 +60,15 @@ var worker_default = {
       if (url.pathname === "/api/search" && request.method === "POST") {
         return handleSearch(request, env);
       }
+      if (url.pathname === "/api/discovery/start" && request.method === "POST") {
+        return handleDiscoveryStart(request, env);
+      }
+      if (url.pathname === "/api/discovery/status" && request.method === "POST") {
+        return handleDiscoveryStatus(request, env);
+      }
+      if (url.pathname === "/api/match-profile" && request.method === "POST") {
+        return handleMatchProfile(request, env);
+      }
       return env.ASSETS.fetch(request);
     } catch (err) {
       return jsonResponse({ error: err && err.message ? err.message : String(err) }, 500);
@@ -549,6 +558,144 @@ async function proposeAndFetchCompanies(env, query) {
   return { companies, jobs };
 }
 __name(proposeAndFetchCompanies, "proposeAndFetchCompanies");
+async function handleDiscoveryStart(request, env) {
+  try {
+    const body = await readJsonBody(request);
+    const query = sanitizeText(body.query, 400);
+    if (!query) return jsonResponse({ error: "No query" }, 400);
+    const system = "You are a company directory. Your ONLY job is to name 100 companies that employ people in a given field. A company is an employer: a firm, studio, agency, or corporation that has employees and posts job openings. Never output concepts, movements, styles, buildings, or individual people.\n\nOutput exactly one company name per line. No numbers, no dashes, no bullets, no explanations.\n\nFor the field \"architecture\", correct answers look like:\nFoster + Partners\nBIG\nOMA\nSnøhetta\nUNStudio\nMVRDV\nPerkins&Will\nGensler";
+    const raw = await chatCompletion(env.REPLICATE_API_KEY, system, `Field: ${query}\n\nList 100 companies that employ people in this field:`, 4000);
+    const companies = parseCompanyList(raw).slice(0, 100);
+    if (!companies.length) return jsonResponse({ error: "No companies proposed" }, 502);
+    const id = "disc_" + crypto.randomUUID().slice(0, 8);
+    const state = {
+      id,
+      query,
+      companies,
+      completed: [],
+      jobs: [],
+      status: "processing",
+      created_at: Date.now()
+    };
+    await env.JOBS_KV.put(`disc:${id}`, JSON.stringify(state), { expirationTtl: 3600 });
+    return jsonResponse({ operation_id: id, status: "processing", suggested_companies: companies });
+  } catch (err) {
+    return jsonResponse({ error: err && err.message ? err.message : String(err) }, err.status || 500);
+  }
+}
+__name(handleDiscoveryStart, "handleDiscoveryStart");
+async function handleDiscoveryStatus(request, env) {
+  try {
+    const body = await readJsonBody(request);
+    const id = sanitizeText(body.operation_id, 100);
+    if (!id) return jsonResponse({ error: "operation_id required" }, 400);
+    const raw = await env.JOBS_KV.get(`disc:${id}`, { type: "json" });
+    if (!raw) return jsonResponse({ error: "operation not found" }, 404);
+    if (raw.status === "complete") {
+      return jsonResponse({
+        operation_id: id,
+        status: "complete",
+        companies_completed: raw.completed.length,
+        companies_total: raw.companies.length,
+        jobs: raw.jobs
+      });
+    }
+    // Process a few companies per call to stay within the browser bridge timeout.
+    const BATCH = 5;
+    const pending = raw.companies.filter((c) => !raw.completed.includes(c));
+    const batch = pending.slice(0, BATCH);
+    const newJobs = [];
+    for (const company of batch) {
+      const jobs = await storeCompanyJobs(company, env);
+      newJobs.push(...jobs);
+    }
+    raw.completed.push(...batch);
+    const seen = new Set(raw.jobs.map((j) => j.url));
+    for (const j of newJobs) if (!seen.has(j.url)) { seen.add(j.url); raw.jobs.push(j); }
+    raw.status = raw.completed.length >= raw.companies.length ? "complete" : "processing";
+    await env.JOBS_KV.put(`disc:${id}`, JSON.stringify(raw), { expirationTtl: 3600 });
+    return jsonResponse({
+      operation_id: id,
+      status: raw.status,
+      companies_completed: raw.completed.length,
+      companies_total: raw.companies.length,
+      jobs: raw.jobs
+    });
+  } catch (err) {
+    return jsonResponse({ error: err && err.message ? err.message : String(err) }, err.status || 500);
+  }
+}
+__name(handleDiscoveryStatus, "handleDiscoveryStatus");
+async function handleMatchProfile(request, env) {
+  try {
+    const body = await readJsonBody(request);
+    const profile = body.profile || null;
+    const limit = Math.min(Math.max(Number(body.limit) || 10, 1), 50);
+    if (!profile) return jsonResponse({ error: "profile required" }, 400);
+    const db = await getAtsDb(env);
+    const query = [
+      ...(profile.roles || []),
+      ...(profile.future_roles || []),
+      ...(profile.skills || []).slice(0, 10),
+      ...(profile.domains || []),
+      ...(profile.industries || []),
+      ...(profile.locations || [])
+    ].join(" ");
+    let scored;
+    if (env.AI) {
+      try { scored = await semanticRank(query, db, env); }
+      catch (e) { scored = keywordRank(query, db); }
+    } else {
+      scored = keywordRank(query, db);
+    }
+    scored = applyLocationFilter(scored, (profile.locations || []).filter(isLocationTag));
+    const jobs = scored.slice(0, limit).map((j) => ({
+      job_id: j.job_posting_id || jobId(j.url),
+      job_title: j.job_title,
+      company_name: j.company_name,
+      job_location: j.job_location,
+      country: j.country,
+      job_seniority_level: j.job_seniority_level,
+      job_employment_type: j.job_employment_type,
+      url: j.url,
+      posted_at: j.job_posted_date,
+      match_score: j.score,
+      match_reasons: matchReasons(j, profile),
+      gaps: matchGaps(j, profile)
+    }));
+    return jsonResponse({ matched_count: jobs.length, jobs });
+  } catch (err) {
+    return jsonResponse({ error: err && err.message ? err.message : String(err) }, err.status || 500);
+  }
+}
+__name(handleMatchProfile, "handleMatchProfile");
+function matchReasons(job, profile) {
+  const reasons = [];
+  const hay = `${job.job_title || ""} ${job.description || ""}`.toLowerCase();
+  for (const skill of (profile.skills || []).slice(0, 12)) {
+    if (skill && hay.includes(skill.toLowerCase())) reasons.push(`Matches skill: ${skill}`);
+  }
+  for (const loc of (profile.locations || [])) {
+    const l = loc.toLowerCase();
+    const jl = `${job.job_location || ""} ${job.country || ""}`.toLowerCase();
+    if (jl.includes(l)) reasons.push(`Location match: ${loc}`);
+  }
+  if (job.job_seniority_level && profile.seniority &&
+      normalizeJobSeniority(job.job_seniority_level) === normalizeJobSeniority(profile.seniority)) {
+    reasons.push(`Seniority match: ${normalizeJobSeniority(profile.seniority)}`);
+  }
+  return reasons.slice(0, 5);
+}
+__name(matchReasons, "matchReasons");
+function matchGaps(job, profile) {
+  const gaps = [];
+  const hay = `${job.job_title || ""} ${job.description || ""}`.toLowerCase();
+  for (const skill of (profile.skills || []).slice(0, 12)) {
+    if (skill && !hay.includes(skill.toLowerCase())) gaps.push(`Job does not mention: ${skill}`);
+  }
+  return gaps.slice(0, 5);
+}
+__name(matchGaps, "matchGaps");
 function parseCompanyList(text) {
   if (!text) return [];
   // Prefer a JSON array if the model returned one.

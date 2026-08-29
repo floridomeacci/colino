@@ -7,16 +7,30 @@
 
 (function registerColinoTools() {
   if (!document.modelContext || typeof document.modelContext.registerTool !== "function") {
-    // WebMCP not available (older browser / flag disabled). Silently skip.
     return;
   }
 
   const API = (path, opts) =>
     fetch(path, opts).then((r) => r.json());
 
-  // WebMCP's executeTool resolves to a DOMString: execute must return a string.
-  function text(content) {
-    return typeof content === "string" ? content : JSON.stringify(content, null, 2);
+  function ok(data, meta = {}) {
+    return { ok: true, data, meta: { generated_at: new Date().toISOString(), ...meta } };
+  }
+
+  function fail(code, message, retryable = false) {
+    return { ok: false, error: { code, message, retryable } };
+  }
+
+  async function safe(fn) {
+    try {
+      return await fn();
+    } catch (err) {
+      const msg = String(err && err.message ? err.message : err);
+      if (/interrupted|retry|timed out|timeout|overloaded|capacity|429/i.test(msg)) {
+        return fail("UPSTREAM_TIMEOUT", msg, true);
+      }
+      return fail("UPSTREAM_ERROR", msg, false);
+    }
   }
 
   const MAX_RESULTS = 50;
@@ -26,12 +40,38 @@
     return String(str || "").slice(0, max).trim();
   }
 
-  async function safe(fn) {
-    try {
-      return await fn();
-    } catch (err) {
-      return text({ error: String(err && err.message ? err.message : err) });
-    }
+  function jobId(j) {
+    return j.job_posting_id || null;
+  }
+
+  function stripHtml(s) {
+    if (!s) return "";
+    return String(s)
+      .replace(/<[^>]+>/g, " ")
+      .replace(/&nbsp;/g, " ")
+      .replace(/&amp;/g, "&")
+      .replace(/&lt;/g, "<")
+      .replace(/&gt;/g, ">")
+      .replace(/&#39;|&apos;/g, "'")
+      .replace(/&quot;/g, '"')
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  function summary(j) {
+    return {
+      job_id: jobId(j),
+      job_title: j.job_title,
+      company_name: j.company_name,
+      job_location: j.job_location,
+      country: j.country,
+      job_seniority_level: j.job_seniority_level,
+      job_employment_type: j.job_employment_type,
+      workplace_type: j.workplace_type,
+      source_url: j.url,
+      posted_at: j.job_posted_date || null,
+      posted_time: j.job_posted_time || null
+    };
   }
 
   const register = async (name, title, description, inputSchema, execute) => {
@@ -42,79 +82,167 @@
     }
   };
 
+  // ── search-jobs: natural language + structured filters ──
   register(
-    "search_jobs",
+    "search-jobs",
     "Search jobs",
-    "Search the Colino job database by a natural-language query and return matching job listings (title, company, location, seniority, URL).",
+    "Search the Colino job database by a natural-language query, with optional structured filters (location, seniority, employment type, remote, salary, sorting). Returns ranked matches with a stable job_id.",
     {
       type: "object",
       properties: {
-        query: { type: "string", description: "Search query, e.g. 'senior product designer'." },
-        limit: { type: "number", description: `Maximum results to return (default 10, max ${MAX_RESULTS}).` }
+        query: { type: "string", minLength: 1, maxLength: 200, description: "Natural-language query, e.g. 'senior product designer'." },
+        locations: { type: "array", items: { type: "string" }, description: "Locations to prefer, e.g. ['Amsterdam', 'Remote EU']." },
+        seniority: { type: "array", items: { type: "string", enum: ["intern", "entry", "associate", "mid", "senior", "lead", "manager", "director", "executive"] }, description: "Seniority levels to include." },
+        employment_types: { type: "array", items: { type: "string", enum: ["full_time", "part_time", "contract", "internship"] }, description: "Employment types to include." },
+        remote: { type: "boolean", description: "True for remote-only, false for on-site only. Omit for either." },
+        posted_within_days: { type: "integer", minimum: 1, maximum: 365, description: "Only jobs posted within this many days." },
+        companies: { type: "array", items: { type: "string" }, description: "Company names to include." },
+        exclude_companies: { type: "array", items: { type: "string" }, description: "Company names to exclude." },
+        sort: { type: "string", enum: ["relevance", "recent", "salary_desc", "salary_asc"], default: "relevance", description: "Sort order." },
+        limit: { type: "integer", minimum: 1, maximum: 50, default: 10, description: "Number of results to return." },
+        cursor: { type: "integer", minimum: 0, default: 0, description: "Pagination offset." }
       },
       required: ["query"]
     },
-    async ({ query, limit }) =>
+    async (input) =>
       safe(async () => {
-        const q = clean(query, MAX_QUERY);
-        if (!q) return text({ error: "query is required" });
-        const n = Math.min(Math.max(Number(limit) || 10, 1), MAX_RESULTS);
-        const jobs = await API("/api/jobs");
-        const tokens = q.toLowerCase().split(/[^a-z0-9+#]+/).filter((t) => t.length > 1);
-        const scored = jobs.map((j) => {
-          const title = (j.job_title || "").toLowerCase();
-          const hay = [j.job_title, j.company_name, j.job_location, j.job_function, j.job_industries, j.description].join(" ").toLowerCase();
-          let s = 0;
-          for (const t of tokens) { if (hay.includes(t)) s++; if (title.includes(t)) s += 2; }
-          return { j, s };
-        }).sort((a, b) => b.s - a.s).filter((x) => x.s > 0);
-        const out = scored.slice(0, n).map((x) => ({
-          title: x.j.job_title,
-          company: x.j.company_name,
-          location: x.j.job_location,
-          seniority: x.j.job_seniority_level,
-          url: x.j.url,
-          posted: x.j.job_posted_time || x.j.job_posted_date
-        }));
-        return text({ total: jobs.length, results: out });
+        const q = clean(input.query, MAX_QUERY);
+        if (!q) return fail("INVALID_INPUT", "query is required");
+        const limit = Math.min(Math.max(Number(input.limit) || 10, 1), MAX_RESULTS);
+        const offset = Math.max(Number(input.cursor) || 0, 0);
+        const tags = [q];
+        if (Array.isArray(input.locations)) tags.push(...input.locations.map((s) => clean(s, 100)).filter(Boolean));
+        const res = await API("/api/search", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ tags: tags.slice(0, 20) })
+        });
+        if (res.error) return fail("UPSTREAM_ERROR", res.error);
+        let jobs = res.jobs || [];
+
+        // Structured filters (post-filtering since /api/search is semantic).
+        if (Array.isArray(input.seniority) && input.seniority.length) {
+          const want = input.seniority.map((s) => String(s).toLowerCase());
+          jobs = jobs.filter((j) => want.includes(String(j.job_seniority_level || "").toLowerCase()));
+        }
+        if (Array.isArray(input.employment_types) && input.employment_types.length) {
+          const want = input.employment_types.map((s) => String(s).toLowerCase());
+          jobs = jobs.filter((j) => {
+            const et = String(j.job_employment_type || "").toLowerCase();
+            return want.some((w) => et.includes(w));
+          });
+        }
+        if (typeof input.remote === "boolean") {
+          const isRemote = /remote/i.test(`${j.job_location || ""} ${j.workplace_type || ""}`.toLowerCase());
+          jobs = jobs.filter((j) => isRemote === input.remote);
+        }
+        if (Number(input.posted_within_days) > 0) {
+          const cutoff = Date.now() - Number(input.posted_within_days) * 86400000;
+          jobs = jobs.filter((j) => j.job_posted_date && new Date(j.job_posted_date).getTime() >= cutoff);
+        }
+        if (Array.isArray(input.companies) && input.companies.length) {
+          const want = input.companies.map((s) => String(s).toLowerCase());
+          jobs = jobs.filter((j) => want.some((w) => String(j.company_name || "").toLowerCase().includes(w)));
+        }
+        if (Array.isArray(input.exclude_companies) && input.exclude_companies.length) {
+          const want = input.exclude_companies.map((s) => String(s).toLowerCase());
+          jobs = jobs.filter((j) => !want.some((w) => String(j.company_name || "").toLowerCase().includes(w)));
+        }
+
+        const matched = jobs.length;
+        if (input.sort === "recent") {
+          jobs.sort((a, b) => new Date(b.job_posted_date || 0) - new Date(a.job_posted_date || 0));
+        } else if (input.sort === "salary_desc" || input.sort === "salary_asc") {
+          const sv = (j) => (j.base_salary && j.base_salary.max_amount) || (j.base_salary && j.base_salary.min_amount) || 0;
+          jobs.sort((a, b) => input.sort === "salary_desc" ? sv(b) - sv(a) : sv(a) - sv(b));
+        }
+
+        const page = jobs.slice(offset, offset + limit);
+        return ok({
+          matched_count: matched,
+          returned_count: page.length,
+          next_cursor: offset + limit < matched ? offset + limit : null,
+          database_total: res.total ?? matched,
+          jobs: page.map(summary)
+        });
       })
   );
 
+  // ── get-job: details by job_id ──
   register(
-    "get_job_details",
+    "get-job",
     "Job details",
-    "Get full details for a specific job listing, including its description, given its URL.",
+    "Get full details for a single job listing by its stable job_id, including the cleaned description.",
     {
       type: "object",
       properties: {
-        url: { type: "string", description: "The full URL of the job listing." }
-      },
-      required: ["url"]
+        job_id: { type: "string", minLength: 1, description: "The stable job_id returned by search-jobs." },
+        source_url: { type: "string", description: "Fallback: look up by the source URL instead." }
+      }
     },
-    async ({ url }) =>
+    async (input) =>
       safe(async () => {
-        const u = clean(url, 500);
-        if (!u) return text({ error: "url is required" });
         const jobs = await API("/api/jobs");
-        const job = jobs.find((j) => j.url === u);
-        if (!job) return text({ error: "Job not found" });
-        const { description, ...rest } = job;
-        return text({ ...rest, description: description ? description.slice(0, 3000) : null });
+        const id = clean(input.job_id, 200);
+        const url = clean(input.source_url, 500);
+        let job;
+        if (id) job = jobs.find((j) => j.job_posting_id === id);
+        if (!job && url) job = jobs.find((j) => j.url === url);
+        if (!job) return fail("JOB_NOT_FOUND", "No job matched that identifier.");
+        return ok({
+          ...summary(job),
+          description_text: stripHtml(job.description),
+          description_truncated: (job.description || "").length > 3000,
+          base_salary: job.base_salary,
+          company_logo: job.company_logo,
+          is_easy_apply: job.is_easy_apply,
+          collected_at: job.collected_at ? new Date(job.collected_at).toISOString() : null
+        });
       })
   );
 
+  // ── get-jobs: batch details ──
   register(
-    "get_companies",
+    "get-jobs",
+    "Multiple job details",
+    "Get full details for several jobs at once, given a list of job_id values.",
+    {
+      type: "object",
+      properties: {
+        job_ids: { type: "array", items: { type: "string" }, minItems: 1, maxItems: 20, description: "List of job_id values." }
+      },
+      required: ["job_ids"]
+    },
+    async (input) =>
+      safe(async () => {
+        const ids = (input.job_ids || []).map((s) => clean(s, 200)).filter(Boolean);
+        if (!ids.length) return fail("INVALID_INPUT", "job_ids is required");
+        const jobs = await API("/api/jobs");
+        const byId = new Map(jobs.map((j) => [j.job_posting_id, j]));
+        const out = [];
+        const missing = [];
+        for (const id of ids) {
+          const j = byId.get(id);
+          if (j) out.push({ ...summary(j), description_text: stripHtml(j.description) });
+          else missing.push(id);
+        }
+        return ok({ jobs: out, missing_job_ids: missing });
+      })
+  );
+
+  // ── get-companies ──
+  register(
+    "get-companies",
     "Companies",
     "List the companies currently represented in the Colino database, with job counts.",
     {
       type: "object",
       properties: {
-        query: { type: "string", description: "Optional substring to filter company names." },
-        limit: { type: "number", description: "Maximum companies to return (default 20)." }
+        query: { type: "string", maxLength: 100, description: "Optional substring to filter company names." },
+        limit: { type: "integer", minimum: 1, maximum: 50, default: 20 }
       }
     },
-    async ({ query, limit }) =>
+    async (input) =>
       safe(async () => {
         const jobs = await API("/api/jobs");
         const counts = new Map();
@@ -123,21 +251,19 @@
           counts.set(c, (counts.get(c) || 0) + 1);
         }
         let entries = [...counts.entries()].sort((a, b) => b[1] - a[1]);
-        const q = clean(query, 100).toLowerCase();
+        const q = clean(input.query, 100).toLowerCase();
         if (q) entries = entries.filter(([name]) => name.toLowerCase().includes(q));
-        const n = Math.min(Math.max(Number(limit) || 20, 1), MAX_RESULTS);
-        return text(entries.slice(0, n).map(([name, count]) => ({ company: name, jobs: count })));
+        const limit = Math.min(Math.max(Number(input.limit) || 20, 1), MAX_RESULTS);
+        return ok({ companies: entries.slice(0, limit).map(([company, jobs]) => ({ company, jobs })) });
       })
   );
 
+  // ── get-stats ──
   register(
-    "get_stats",
+    "get-stats",
     "Platform stats",
     "Return aggregate platform statistics: total jobs, number of companies, and seniority distribution.",
-    {
-      type: "object",
-      properties: {}
-    },
+    { type: "object", properties: {} },
     async () =>
       safe(async () => {
         const jobs = await API("/api/jobs");
@@ -147,39 +273,149 @@
           const s = j.job_seniority_level || "Unknown";
           seniority[s] = (seniority[s] || 0) + 1;
         }
-        return text({ total_jobs: jobs.length, companies: companies.size, seniority });
+        return ok({ total_jobs: jobs.length, companies: companies.size, seniority });
       })
   );
 
+  // ── get-active-profile-summary ──
   register(
-    "propose_companies",
-    "Propose companies",
-    "Given a role or domain, generate a list of companies that hire for it, then fetch their live job postings. Returns the suggested companies and the jobs discovered.",
+    "get-active-profile-summary",
+    "Active profile",
+    "Return the current session's CV profile (target roles, seniority, skills, preferred locations). This is a session-scoped summary and never includes contact details.",
+    { type: "object", properties: {} },
+    async () => {
+      const profile = window.__colinoProfile;
+      if (!profile) return fail("NO_PROFILE", "No resume has been uploaded in this session yet.");
+      return ok({
+        profile_id: "session",
+        target_roles: profile.roles || [],
+        future_roles: profile.future_roles || [],
+        seniority: profile.seniority || null,
+        skills: profile.skills || [],
+        industries: profile.industries || [],
+        preferred_locations: profile.locations || []
+      });
+    }
+  );
+
+  // ── match-jobs-to-profile ──
+  register(
+    "match-jobs-to-profile",
+    "Match to profile",
+    "Rank the job database against the active CV profile and return the best matches with a score and reasons.",
     {
       type: "object",
       properties: {
-        role: { type: "string", description: "A role, domain, or search phrase, e.g. 'interior design netherlands' or 'senior product designer'." }
+        limit: { type: "integer", minimum: 1, maximum: 50, default: 10 }
+      }
+    },
+    async (input) =>
+      safe(async () => {
+        const profile = window.__colinoProfile;
+        if (!profile) return fail("NO_PROFILE", "No resume has been uploaded in this session yet.");
+        const limit = Math.min(Math.max(Number(input.limit) || 10, 1), MAX_RESULTS);
+        const res = await API("/api/match-profile", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ profile, limit })
+        });
+        if (res.error) return fail("UPSTREAM_ERROR", res.error);
+        return ok(res);
+      })
+  );
+
+  // ── explain-job-match ──
+  register(
+    "explain-job-match",
+    "Explain match",
+    "Explain why a specific job matches the active profile, listing match reasons and gaps.",
+    {
+      type: "object",
+      properties: {
+        job_id: { type: "string", minLength: 1, description: "The job_id to explain." }
+      },
+      required: ["job_id"]
+    },
+    async (input) =>
+      safe(async () => {
+        const profile = window.__colinoProfile;
+        if (!profile) return fail("NO_PROFILE", "No resume has been uploaded in this session yet.");
+        const jobs = await API("/api/jobs");
+        const id = clean(input.job_id, 200);
+        const job = jobs.find((j) => j.job_posting_id === id);
+        if (!job) return fail("JOB_NOT_FOUND", "No job matched that job_id.");
+        const res = await API("/api/match-profile", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ profile, limit: 100 })
+        });
+        const match = (res.jobs || []).find((m) => m.job_id === id);
+        return ok({
+          job_id: id,
+          job_title: job.job_title,
+          match_score: match ? match.match_score : null,
+          match_reasons: match ? match.match_reasons : [],
+          gaps: match ? match.gaps : []
+        });
+      })
+  );
+
+  // ── start-company-discovery ──
+  register(
+    "start-company-discovery",
+    "Start company discovery",
+    "Propose a list of companies that hire for a role or domain. Returns immediately with the suggested companies and an operation_id for polling.",
+    {
+      type: "object",
+      properties: {
+        role: { type: "string", minLength: 1, maxLength: 200, description: "A role, domain, or search phrase, e.g. 'product designer'." }
       },
       required: ["role"]
     },
-    async ({ role }) =>
+    async (input) =>
       safe(async () => {
-        const q = clean(role, MAX_QUERY);
-        if (!q) return text({ error: "role is required" });
-        const data = await API("/api/leads", {
+        const q = clean(input.role, MAX_QUERY);
+        if (!q) return fail("INVALID_INPUT", "role is required");
+        const res = await API("/api/discovery/start", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ query: q })
         });
-        if (data.error) return text({ error: data.error });
-        const jobs = (data.jobs || []).map((j) => ({
-          title: j.job_title,
-          company: j.company_name,
-          location: j.job_location,
-          seniority: j.job_seniority_level,
-          url: j.url
-        }));
-        return text({ companies: data.companies || [], companies_count: (data.companies || []).length, jobs_count: jobs.length, jobs: jobs.slice(0, MAX_RESULTS) });
+        if (res.error) return fail("UPSTREAM_ERROR", res.error);
+        return ok(res);
+      })
+  );
+
+  // ── get-company-discovery-status ──
+  register(
+    "get-company-discovery-status",
+    "Company discovery status",
+    "Poll the progress of a company discovery operation and retrieve fetched jobs as they complete. Call repeatedly until status is 'complete'.",
+    {
+      type: "object",
+      properties: {
+        operation_id: { type: "string", minLength: 1, description: "The operation_id from start-company-discovery." }
+      },
+      required: ["operation_id"]
+    },
+    async (input) =>
+      safe(async () => {
+        const id = clean(input.operation_id, 100);
+        if (!id) return fail("INVALID_INPUT", "operation_id is required");
+        const res = await API("/api/discovery/status", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ operation_id: id })
+        });
+        if (res.error) return fail("UPSTREAM_ERROR", res.error);
+        const jobs = (res.jobs || []).map(summary);
+        return ok({
+          operation_id: id,
+          status: res.status,
+          companies_completed: res.companies_completed,
+          companies_total: res.companies_total,
+          jobs
+        });
       })
   );
 })();

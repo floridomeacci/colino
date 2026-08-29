@@ -808,6 +808,7 @@ async function processCV(file) {
       const data = await res.json();
       if (data.error) throw new Error(data.error);
       profileCache = data.profile;
+      window.__colinoProfile = data.profile;
 
       // Build notes from the profile
       const p = data.profile || {};
