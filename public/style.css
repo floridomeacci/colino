@@ -1735,7 +1735,7 @@ body {
     box-shadow: 0 0 40px oklch(0 0 0 / 0.12);
   }
 
-  .sidebar:not(.sidebar-collapsed) {
+  .app:not(.sidebar-collapsed) .sidebar {
     transform: translateX(0);
   }
 

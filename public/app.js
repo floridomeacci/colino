@@ -986,10 +986,10 @@ async function extractPDFText(file) {
   try {
     const saved = localStorage.getItem('fitlist_sidebar');
     const isMobile = window.matchMedia('(max-width: 720px)').matches;
-    // On mobile, default to collapsed (slide-over hidden) unless user explicitly opened it.
-    if (saved !== null) {
-      if (saved === '1') app.classList.add('sidebar-collapsed');
-    } else if (isMobile) {
+    // On mobile, always start collapsed (the slide-over is opt-in via the toggle).
+    if (isMobile) {
+      app.classList.add('sidebar-collapsed');
+    } else if (saved === '1') {
       app.classList.add('sidebar-collapsed');
     }
   } catch (e) {}
