@@ -787,6 +787,28 @@ body {
   opacity: 1;
 }
 
+/* Subtle search-in-progress shimmer over the active search tags. */
+.is-searching .tag-chip {
+  position: relative;
+  overflow: hidden;
+}
+
+.is-searching .tag-chip::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(100deg, transparent 25%, var(--accent) 50%, transparent 75%);
+  background-size: 200% 100%;
+  opacity: 0.32;
+  animation: chipShimmer 1.3s linear infinite;
+  pointer-events: none;
+}
+
+@keyframes chipShimmer {
+  0% { background-position: 180% 0; }
+  100% { background-position: -80% 0; }
+}
+
 /* ─── Query pills ─── */
 .pill-row {
   display: flex;

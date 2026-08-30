@@ -110,15 +110,20 @@ function clearTags() {
 }
 
 let semanticTimer = null;
+function setSearching(on) {
+  document.body.classList.toggle('is-searching', on);
+}
 function runSemanticSearch() {
   if (!activeTags.length) {
     semanticScores = null;
+    setSearching(false);
     applyFilters();
     updateStats();
     return;
   }
   clearTimeout(semanticTimer);
   semanticTimer = setTimeout(async () => {
+    setSearching(true);
     try {
       const res = await fetch('/api/search', {
         method: 'POST',
@@ -134,6 +139,7 @@ function runSemanticSearch() {
     } catch (e) {
       semanticScores = null;
     }
+    setSearching(false);
     applyFilters();
     updateStats();
   }, 0);
