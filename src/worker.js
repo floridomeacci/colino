@@ -497,8 +497,8 @@ async function handleSearch(request, env) {
     const query = tags.join(" ");
     const intent = await parseQueryIntent(env, query);
     const rerank = body.rerank !== false;
-    const locationStrict = body.location_mode === "strict";
-    const regionStrict = !!intent.location_strict;
+    const locationStrict = body.location_mode === "strict" || !!intent.location_strict;
+    const regionStrict = !!intent.region_strict;
     const opts = { likes, dislikes, rerank, locationStrict, regionStrict };
     const ranked = await hybridRank(env, intent, db, opts);
     return jsonResponse({
@@ -507,7 +507,7 @@ async function handleSearch(request, env) {
       search_mode: "hybrid",
       rerank_status: opts.meta ? opts.meta.rerank_status : null,
       meta: opts.meta || null,
-      intent: { target_roles: intent.target_roles, related_roles: intent.related_roles, exclude: intent.exclude, location_strict: locationStrict || regionStrict }
+      intent: { target_roles: intent.target_roles, related_roles: intent.related_roles, exclude: intent.exclude, location_strict: locationStrict || regionStrict, preferred_locations: intent.preferred_locations }
     });
   } catch (err) {
     return jsonResponse({ error: err && err.message ? err.message : String(err) }, err.status || 500);
@@ -630,6 +630,9 @@ async function hybridRank(env, intent, jobs, opts = {}) {
   const enriched = jobs.map(enrichJob);
   const deduped = dedupJobs(enriched, intent);
   const result = [];
+  // A query with a location but no extracted role (e.g. just "netherlands") is a
+  // browse-by-location search, not a role search.
+  const noRoleIntent = !(intent.target_roles || []).length && !(intent.related_roles || []).length;
 
   // Embeddings for separate fields (title + description).
   let qTitleVec = null, qDescVec = null, titleVecs = [], descVecs = [];
@@ -650,6 +653,9 @@ async function hybridRank(env, intent, jobs, opts = {}) {
     const job = deduped[i];
     const h = hybridScore(job, intent, titleVecs[i], descVecs[i], qTitleVec, qDescVec);
     if (h === -1) continue; // excluded
+    // Location-only query (e.g. "netherlands" with no role): don't role-gate, let the
+    // strict location filter pick the right jobs.
+    if (noRoleIntent) h.roleFit = Math.max(h.roleFit, ROLE_FIT_QUALIFIED);
     if (h.base < MIN_RELEVANCE) continue;
     // Deterministic role gate: a job must share the requested role family before
     // location or any preference can help it. Weak (partial) role matches are kept
@@ -1273,7 +1279,7 @@ function strArr(v) {
 __name(strArr, "strArr");
 // Parse a natural-language query into structured intent, cached in KV.
 async function parseQueryIntent(env, query) {
-  const key = "intent:v2:" + simpleHash(query);
+  const key = "intent:v3:" + simpleHash(query);
   const cached = await env.JOBS_KV.get(key, { type: "json" });
   if (cached) return cached;
   const system = `You parse a job search query into structured intent. Return ONLY JSON, no markdown, with these keys:
@@ -1313,9 +1319,15 @@ async function parseQueryIntent(env, query) {
   if (mRemote) {
     const reg = regionFor(mRemote[1]);
     prefs.add(reg ? `remote ${reg}` : mRemote[1]);
-    // A literal "remote <region>" is explicit eligibility, not a soft preference.
-    intent.location_strict = true;
+    // A literal "remote <region>" is explicit eligibility for that region.
+    intent.region_strict = true;
   }
+  // An explicit city/country (e.g. "netherlands", "amsterdam", "new york") is a
+  // mandatory location, not a soft preference. Detect it deterministically so a
+  // location tag always surfaces that location's jobs first.
+  const locTags = detectLocations(query);
+  for (const l of locTags) prefs.add(l.toLowerCase());
+  if (locTags.length) intent.location_strict = true;
   for (const kw of ["emea", "europe", "apac", "worldwide", "asia pacific"]) {
     if (qLow.includes(kw)) prefs.add(kw);
   }
@@ -1793,6 +1805,31 @@ function inferCountry(location) {
   return null;
 }
 __name(inferCountry, "inferCountry");
+// Deterministic location extraction from a raw query: returns the canonical city /
+// country / region names mentioned. Used to make explicit location tags mandatory.
+function detectLocations(query) {
+  if (!query) return [];
+  const s = String(query).toLowerCase();
+  const words = ` ${s.replace(/[^a-z0-9]+/g, " ")} `;
+  const found = [];
+  const add = (x) => { if (x && !found.some((f) => f.toLowerCase() === x.toLowerCase())) found.push(x); };
+  // Countries (full names, with word boundaries so "in" never matches India).
+  for (const name of Object.values(ISO_COUNTRIES)) {
+    const n = name.toLowerCase();
+    if (words.includes(` ${n.replace(/[^a-z0-9]+/g, " ")} `)) add(name);
+  }
+  // Colloquial country forms and codes.
+  if (/(usa|\bus\b|america)/.test(s)) add("United States");
+  if (/(uk|\bgb\b|britain)/.test(s)) add("United Kingdom");
+  if (/(netherlands|holland)/.test(s)) add("Netherlands");
+  // Cities.
+  for (const [city] of Object.entries(CITY_COUNTRIES)) {
+    const compact = city.replace(/[^a-z0-9]+/g, "");
+    if (compact && words.includes(` ${compact} `)) add(city);
+  }
+  return found;
+}
+__name(detectLocations, "detectLocations");
 function canonicalSeniority(raw) {
   if (!raw) return "unknown";
   const s = String(raw).toLowerCase().trim();

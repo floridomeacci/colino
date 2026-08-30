@@ -1,11 +1,19 @@
 {
   "queries": [
     {
-      "query": "creative technologist amsterdam",
+      "query": "creative technologist",
       "assert": {
         "roles": ["creative technologist", "design technologist", "technical artist", "creative developer"],
-        "locations": ["amsterdam", "netherlands"],
         "forbidden": ["backend engineer", "data engineer"]
+      }
+    },
+    {
+      "query": "product designer netherlands",
+      "assert": {
+        "roles": ["product designer"],
+        "locations": ["netherlands", "amsterdam", "rotterdam", "utrecht"],
+        "location_mandatory": ["netherlands", "amsterdam", "rotterdam", "utrecht"],
+        "forbidden": ["sales engineer"]
       }
     },
     {
@@ -33,10 +41,9 @@
       }
     },
     {
-      "query": "design leader hybrid rotterdam",
+      "query": "design leader",
       "assert": {
         "roles": ["lead designer", "head of design", "design director", "design lead", "creative lead"],
-        "locations": ["rotterdam", "netherlands"],
         "forbidden": ["junior", "intern"]
       }
     },

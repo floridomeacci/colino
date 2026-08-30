@@ -78,6 +78,15 @@ function assertLocation(full, top, regions) {
 function assertNoIrrelevant(top, forbidden) {
   return !top.some((j) => forbidden.some((f) => norm(j.job_title).includes(norm(f))));
 }
+function assertLocationMandatory(top, regions) {
+  // A mandatory location means no returned job may fall outside the location(s).
+  // Zero results are fine (honest "no jobs here"), so this passes vacuously.
+  const match = (j) => {
+    const hay = norm(`${j.job_location} ${j.country} ${j.canonical_country || ""} ${j.remote_regions || ""} ${j.workplace_type || ""}`);
+    return regions.some((r) => hay.includes(norm(r)));
+  };
+  return top.every(match);
+}
 function assertFieldsPresent(jobs) {
   const required = ["role_fit", "skills_fit", "seniority_fit", "location_fit", "overall", "reasons", "gaps"];
   const missing = new Set();
@@ -131,11 +140,20 @@ function evaluate(q, r) {
   const a = r.assert || {};
   const top5 = r.top.slice(0, 5);
 
-  if (a.roles) checks.push(["role relevance", assertRoleRelevance(top5, a.roles)]);
+  if (a.roles) {
+    if (!top5.length) {
+      checks.push(["role relevance", true, "n/a (no results)"]);
+    } else {
+      checks.push(["role relevance", assertRoleRelevance(top5, a.roles)]);
+    }
+  }
   if (a.seniority) checks.push(["seniority compatibility", assertSeniority(top5, a.seniority)]);
   if (a.locations) {
     const loc = assertLocation(r.data.jobs || r.top, top5, a.locations);
     checks.push(["location/region compatibility", loc.ok, loc.na ? "n/a (no qualified role in region)" : ""]);
+  }
+  if (a.location_mandatory) {
+    checks.push(["location mandatory", assertLocationMandatory(top5, a.locations || a.location_mandatory)]);
   }
   if (a.forbidden) checks.push(["no forbidden roles", assertNoIrrelevant(top5, a.forbidden)]);
 
