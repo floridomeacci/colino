@@ -87,6 +87,7 @@
       remote_regions: j.remote_regions || null,
       canonical_country: j.canonical_country || null,
       _dup_count: j._dup_count || null,
+      rerank_status: j.rerank_status || null,
       role_fit: r ? r.role_fit : null,
       skills_fit: r ? r.skills_fit : null,
       seniority_fit: r ? r.seniority_fit : null,
@@ -147,18 +148,16 @@
         const res = await API("/api/search", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ tags: tags.slice(0, 20) })
+          body: JSON.stringify({
+            tags: tags.slice(0, 20),
+            location_mode: input.location_mode === "strict" ? "strict" : "prefer"
+          })
         });
         if (res.error) return fail("UPSTREAM_ERROR", res.error);
         let jobs = res.jobs || [];
 
         // Structured filters (post-filtering since /api/search is semantic).
-        if (input.location_mode === "strict" && locs.length) {
-          jobs = jobs.filter((j) => {
-            const jl = `${j.job_location || ""} ${j.country || ""}`.toLowerCase();
-            return locs.some((l) => jl.includes(l.toLowerCase()));
-          });
-        }
+        // Note: location strictness is enforced server-side before reranking.
         if (Array.isArray(input.seniority) && input.seniority.length) {
           const want = input.seniority.map((s) => String(s).toLowerCase());
           jobs = jobs.filter((j) => want.includes(String(j.job_seniority || "unknown").toLowerCase()));

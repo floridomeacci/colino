@@ -497,7 +497,9 @@ async function handleSearch(request, env) {
     const query = tags.join(" ");
     const intent = await parseQueryIntent(env, query);
     const rerank = body.rerank !== false;
-    const opts = { likes, dislikes, rerank };
+    const locationStrict = body.location_mode === "strict";
+    const regionStrict = !!intent.location_strict;
+    const opts = { likes, dislikes, rerank, locationStrict, regionStrict };
     const ranked = await hybridRank(env, intent, db, opts);
     return jsonResponse({
       jobs: ranked.slice(0, 500),
@@ -505,7 +507,7 @@ async function handleSearch(request, env) {
       search_mode: "hybrid",
       rerank_status: opts.meta ? opts.meta.rerank_status : null,
       meta: opts.meta || null,
-      intent: { target_roles: intent.target_roles, related_roles: intent.related_roles, exclude: intent.exclude }
+      intent: { target_roles: intent.target_roles, related_roles: intent.related_roles, exclude: intent.exclude, location_strict: locationStrict || regionStrict }
     });
   } catch (err) {
     return jsonResponse({ error: err && err.message ? err.message : String(err) }, err.status || 500);
@@ -621,7 +623,7 @@ const ROLE_FIT_QUALIFIED = 0.65; // at/above this the job is a solid role match:
 // Hybrid retrieval + weighted relevance + preference rerank.
 // Returns an array of jobs with { score, relevance, reasons, gaps, location_tier }.
 async function hybridRank(env, intent, jobs, opts = {}) {
-  const { likes, dislikes, rerank = true } = opts;
+  const { likes, dislikes, rerank = true, locationStrict = false, regionStrict = false } = opts;
   const MIN_RELEVANCE = opts.minRelevance != null ? opts.minRelevance : 0.42;
 
   // Enrich then deduplicate before scoring so one company can't dominate.
@@ -665,6 +667,15 @@ async function hybridRank(env, intent, jobs, opts = {}) {
   for (const j of result) {
     const { bonus: locBonus, tier } = locationTier(intent, j);
     j.location_tier = tier;
+    // Strict location eligibility: an explicit "remote eu" (or location_mode strict)
+    // drops jobs outside the requested region before any LLM rerank is paid for.
+    // regionStrict (literal "remote eu") drops only wrong-region jobs; locationStrict
+    // (explicit mode) drops wrong-region and non-matching on-site jobs.
+    if ((locationStrict && (tier === "incompatible" || tier === "region_mismatch")) ||
+        (regionStrict && tier === "region_mismatch")) {
+      j._drop = true;
+      continue;
+    }
     // Role gate on location: a weak role match gets a muted location preference so
     // nearby-but-irrelevant jobs cannot leapfrog true role matches.
     let effectiveBonus = locBonus;
@@ -677,6 +688,11 @@ async function hybridRank(env, intent, jobs, opts = {}) {
     else if (disCompanies.has(normalizeCompanyName(j.company_name))) adj -= 0.02;
     j.score = Math.round((j.relevance + adj) * 100);
     j.preference_adjustment = +adj.toFixed(4);
+  }
+  if (locationStrict || regionStrict) {
+    const kept = result.filter((j) => !j._drop);
+    result.length = 0;
+    result.push(...kept);
   }
 
   result.sort((a, b) => b.score - a.score);
@@ -734,6 +750,7 @@ function llmModelName(env) {
   return env.DEEPSEEK_API_KEY ? "deepseek-chat" : "deepseek-v3 (replicate)";
 }
 __name(llmModelName, "llmModelName");
+const RERANK_ROLE_FLOOR = 0.45; // LLM-scored jobs below this role fit are dropped as off-family.
 async function rerankWithLLM(env, intent, candidates) {
   const meta = { rerank_status: "skipped", rerank_model: llmModelName(env), candidates_reranked: 0 };
   // Role gate on the cross-encoder: only solid role matches (qualified band) are
@@ -745,6 +762,8 @@ async function rerankWithLLM(env, intent, candidates) {
   const top = qualified.slice(0, 30);
   if (!top.length) {
     meta.rerank_status = "skipped";
+    for (const j of qualified) j.rerank_status = "not_reranked";
+    for (const j of weak) j.rerank_status = "not_reranked";
     return { jobs: [...qualified, ...weak], meta };
   }
   const rows = top.map((j, i) => `${i} | ${j.job_title} | ${j.company_name} | ${j.job_location || ""} | ${j.job_seniority || "unknown"} | tier=${j.location_tier || "unknown"}`).join("\n");
@@ -762,6 +781,8 @@ Location rules: each row ends with a precomputed "tier". exact_city and compatib
   }
   if (!parsed || !Array.isArray(parsed.results)) {
     meta.rerank_status = "failed";
+    for (const j of qualified) j.rerank_status = "not_reranked";
+    for (const j of weak) j.rerank_status = "not_reranked";
     return { jobs: [...qualified, ...weak], meta };
   }
   const byIdx = new Map(parsed.results.map((r) => [Number(r.idx), r]));
@@ -772,17 +793,26 @@ Location rules: each row ends with a precomputed "tier". exact_city and compatib
         role_fit: r.role_fit, skills_fit: r.skills_fit, seniority_fit: r.seniority_fit,
         location_fit: r.location_fit, overall: r.overall, reasons: r.reasons || [], gaps: r.gaps || []
       };
+      top[i].rerank_status = "completed";
       // Preserve the pre-computed preference adjustment (location tier + feedback)
       // so the region/eligibility signal is never lost to the LLM's own estimate.
       const adj = top[i].preference_adjustment || 0;
       top[i].score = Math.round(((r.overall ?? top[i].relevance) + adj) * 100);
+    } else {
+      top[i].rerank_status = "not_reranked";
     }
   }
-  top.sort((a, b) => b.score - a.score);
+  // Low-role-fit leakage: the deterministic gate passed these, but the LLM judged them
+  // off-family. Drop them so the cross-encoder never surfaces a weak role match.
+  const survivors = top.filter((j) => !j.rerank || (j.rerank.role_fit ?? 1) >= RERANK_ROLE_FLOOR);
+  const dropped = top.length - survivors.length;
+  survivors.sort((a, b) => b.score - a.score);
   const rest = qualified.slice(30);
+  for (const j of rest) j.rerank_status = "not_reranked";
+  for (const j of weak) j.rerank_status = "not_reranked";
   meta.rerank_status = "completed";
-  meta.candidates_reranked = parsed.results.length;
-  return { jobs: [...top, ...rest, ...weak], meta };
+  meta.candidates_reranked = parsed.results.length - dropped;
+  return { jobs: [...survivors, ...rest, ...weak], meta };
 }
 __name(rerankWithLLM, "rerankWithLLM");
 // ─── Job-data enrichment (remote regions, work authorization, canonical location) ───
@@ -793,14 +823,17 @@ function enrichJob(j) {
   j.workplace_type = j.workplace_type || (isRemote ? "Remote" : null);
   j.remote_regions = null;
   if (isRemote) {
-    // Detect remote geographic restrictions from the location text.
+    // Detect remote geographic restrictions from the location text. The patterns
+    // are ordered to avoid overlap ("north america" must not match the "us" test).
     j.remote_regions = [];
     for (const [region, test] of [
-      ["EU", /(europe|eu|emea)/i],
-      ["UK", /(uk|united kingdom)/i],
-      ["US", /(us|usa|united states|america)/i],
-      ["APAC", /(apac|asia pacific)/i],
-      ["Worldwide", /(worldwide|anywhere|global)/i]
+      ["Worldwide", /(worldwide|anywhere|global)/i],
+      ["EU", /(europe|emea|european union|\beu\b)/i],
+      ["UK", /(united kingdom|\buk\b|great britain|\bgb\b)/i],
+      ["US", /(united states|\bus\b|usa)/i],
+      ["North America", /(north america|canada)/i],
+      ["Latin America", /(latin america|south america|mexico|brazil|argentina|chile|colombia)/i],
+      ["APAC", /(apac|asia pacific|asia)/i]
     ]) {
       if (test.test(j.job_location || "")) j.remote_regions.push(region);
     }
@@ -1276,10 +1309,12 @@ async function parseQueryIntent(env, query) {
   const qLow = ` ${query.toLowerCase()} `;
   if (/\bremote\b/.test(qLow)) intent.remote_preference = intent.remote_preference || "remote";
   const prefs = new Set((intent.preferred_locations || []).map((s) => s.toLowerCase()));
-  const mRemote = qLow.match(/\bremote\s+(eu|emea|europe|uk|us|usa|united states|united kingdom|apac|asia|worldwide|anywhere|global)\b/);
+  const mRemote = qLow.match(/\bremote\s+(eu|emea|europe|uk|us|usa|united states|united kingdom|apac|asia|worldwide|anywhere|global|canada|north america)\b/);
   if (mRemote) {
     const reg = regionFor(mRemote[1]);
     prefs.add(reg ? `remote ${reg}` : mRemote[1]);
+    // A literal "remote <region>" is explicit eligibility, not a soft preference.
+    intent.location_strict = true;
   }
   for (const kw of ["emea", "europe", "apac", "worldwide", "asia pacific"]) {
     if (qLow.includes(kw)) prefs.add(kw);
@@ -1593,6 +1628,7 @@ async function getAtsDb(env) {
     if (!jobs) continue;
     for (const j of jobs) {
       if (!j.collected_at || j.collected_at >= cutoff) {
+        if (isTestJob(j)) continue; // drop bogus/test postings from ATS boards
         if (!j.country) j.country = inferCountry(j.job_location);
         if (!j.company_logo) j.company_logo = logoFromJob(j);
         if (j.job_seniority_level) {
@@ -1621,6 +1657,15 @@ async function getAtsDb(env) {
   });
 }
 __name(getAtsDb, "getAtsDb");
+function isTestJob(j) {
+  const company = String(j.company_name || "").toLowerCase();
+  const title = String(j.job_title || "").toLowerCase();
+  if (company.includes("test company")) return true;
+  if (company.includes(" test ")) return true;
+  if (/^(test|test job|test posting|testing)\b/.test(title)) return true;
+  return false;
+}
+__name(isTestJob, "isTestJob");
 function slugCandidates(name) {
   const base = name.toLowerCase().replace(/[^a-z0-9]+/g, "");
   if (!base) return [];
@@ -1734,11 +1779,17 @@ function inferCountry(location) {
   if (CITY_COUNTRIES[city]) return CITY_COUNTRIES[city];
   const compact = city.replace(/[^a-z0-9]+/g, "");
   if (CITY_COUNTRIES[compact]) return CITY_COUNTRIES[compact];
-  // Common region / multi-word location fallbacks.
-  if (/(bay area|san francisco|california|silicon valley)/.test(s)) return "United States";
-  if (/(new york|nyc)/.test(s)) return "United States";
-  if (/(greater london|united kingdom|uk)\b/.test(s)) return "United Kingdom";
-  if (/(netherlands|amsterdam)/.test(s)) return "Netherlands";
+  // Full country name anywhere in the string (catches "Cary, North Carolina,
+  // United States" and "Remote - Canada: Select locations").
+  for (const name of Object.values(ISO_COUNTRIES)) {
+    if (s.includes(name.toLowerCase())) return name;
+  }
+  // Region / code / colloquial fallbacks the full-name pass misses.
+  if (/(bay area|silicon valley|california|new york|nyc|usa|\bus\b)/.test(s)) return "United States";
+  if (/(canada|toronto|vancouver|montreal)/.test(s)) return "Canada";
+  if (/(uk|britain|london|manchester|edinburgh)/.test(s)) return "United Kingdom";
+  if (/(netherlands|holland|amsterdam|rotterdam)/.test(s)) return "Netherlands";
+  if (/(germany|berlin|munich|hamburg)/.test(s)) return "Germany";
   return null;
 }
 __name(inferCountry, "inferCountry");
@@ -2218,18 +2269,19 @@ function locationTier(profile, job) {
     }
   }
 
-  // Country / region match.
+  // Country / region match (word-boundary so "us" never matches "Uusimaa"/"Australia").
   for (const l of locs) {
-    if (l === "remote") continue;
-    if (country && country.includes(l)) return { bonus: 3, tier: "country" };
-    if (loc && loc.includes(l)) return { bonus: 3, tier: "region" };
+    if (l === "remote" || l.length <= 2) continue;
+    const re = new RegExp(`\\b${l.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`);
+    if (country && re.test(country)) return { bonus: 3, tier: "country" };
+    if (loc && re.test(loc)) return { bonus: 3, tier: "region" };
   }
 
   // Region-restricted remote preference (e.g. "remote eu", "remote us", "emea").
   // Parse the region from the preference and compare against the job's actual
   // remote region(s), so "remote EU" is region compatibility, not just "remote".
   const prefRegions = locs.map(regionFor).filter(Boolean);
-  const jobRegions = new Set((job.remote_regions || []).map((r) => String(r).toLowerCase()));
+  const jobRegions = new Set((job.remote_regions || []).map((r) => regionFor(r)).filter(Boolean));
   if (prefRegions.length) {
     const inRegion = prefRegions.some((r) =>
       r === "worldwide" ||
@@ -2260,12 +2312,13 @@ __name(locationTier, "locationTier");
 function regionFor(s) {
   const t = String(s || "").toLowerCase().trim();
   if (!t) return null;
-  if (/\b(europe|eu|emea|european union)\b/.test(t)) return "eu";
-  if (/\b(uk|united kingdom|gb|great britain|britain)\b/.test(t)) return "uk";
-  if (/\b(us|usa|united states|america|north america)\b/.test(t)) return "us";
-  if (/\b(apac|asia pacific|asia)\b/.test(t)) return "apac";
-  if (/\b(worldwide|anywhere|global)\b/.test(t)) return "worldwide";
-  if (EU_CODES.has(t)) return "eu";
+  if (/(europe|emea|european union|\beu\b)/.test(t) || EU_CODES.has(t)) return "eu";
+  if (/(united kingdom|\buk\b|\bgb\b|great britain|britain)/.test(t)) return "uk";
+  if (/(north america|canada)/.test(t)) return "na";
+  if (/(latin america|south america|mexico|brazil|argentina|chile|colombia)/.test(t)) return "latam";
+  if (/(united states|\bus\b|usa)/.test(t)) return "us";
+  if (/(apac|asia pacific|asia)/.test(t)) return "apac";
+  if (/(worldwide|anywhere|global)/.test(t)) return "worldwide";
   return null;
 }
 __name(regionFor, "regionFor");
