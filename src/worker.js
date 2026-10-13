@@ -2840,7 +2840,7 @@ __name(formatDate, "formatDate");
 const BLOG_PAGE_SIZE = 6;
 async function getPostIndex(env) {
   try {
-    const idx = await env.JOBS_KV.get("post:index", { type: "json" });
+    const idx = await env.JOBS_KV.get("post:index:v2", { type: "json" });
     return Array.isArray(idx) ? idx : [];
   } catch (e) {
     return [];
@@ -2871,10 +2871,9 @@ function blogShell({ title, description, active, contentHtml }) {
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=DM+Serif+Display&family=DM+Sans:ital,opsz,wght@0,9..40,300..700;1,9..40,300..700&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="/style.css?v=30">
+<link rel="stylesheet" href="/style.css?v=31">
 </head>
 <body>
-<div class="page">
   <header class="masthead">
     <div class="masthead-inner">
       <div class="masthead-left">
@@ -2887,6 +2886,7 @@ function blogShell({ title, description, active, contentHtml }) {
       </nav>
     </div>
   </header>
+<div class="page">
   ${contentHtml}
   <footer class="site-footer" style="padding: var(--space-l) 0;">
     <span>Built by <a href="https://floridomeacci.xyz" target="_blank" rel="noopener noreferrer">Florido Meacci</a></span>
@@ -2906,10 +2906,13 @@ async function handleBlogList(request, env) {
     const cards = paged.map((p, i) => `
     <article class="blog-card">
       <a class="blog-card-link" href="/blog/${encodeURIComponent(p.slug)}">
-        <time datetime="${escapeHtml(p.published_at || "")}">${escapeHtml(formatDate(p.published_at))}</time>
-        <h2>${escapeHtml(p.title)}</h2>
-        <p>${escapeHtml(p.excerpt || "")}</p>
-        ${(p.tags || []).length ? `<div class="blog-card-tags">${p.tags.map((t) => `<span>${escapeHtml(t)}</span>`).join("")}</div>` : ""}
+        ${p.cover ? `<div class="blog-card-cover"><img src="${escapeHtml(p.cover)}" alt="${escapeHtml(p.title)}" loading="lazy"></div>` : ""}
+        <div class="blog-card-body">
+          <time datetime="${escapeHtml(p.published_at || "")}">${escapeHtml(formatDate(p.published_at))}</time>
+          <h2>${escapeHtml(p.title)}</h2>
+          <p>${escapeHtml(p.excerpt || "")}</p>
+          ${(p.tags || []).length ? `<div class="blog-card-tags">${p.tags.map((t) => `<span>${escapeHtml(t)}</span>`).join("")}</div>` : ""}
+        </div>
       </a>
     </article>`).join("");
     const pageLinks = [];
@@ -2948,6 +2951,7 @@ async function handleBlogPost(env, slug) {
       <h1>${escapeHtml(post.title)}</h1>
       ${post.author ? `<p class="blog-post-author">By ${escapeHtml(post.author)}</p>` : ""}
     </header>
+    ${post.cover ? `<figure class="blog-post-cover"><img src="${escapeHtml(post.cover)}" alt="${escapeHtml(post.title)}"></figure>` : ""}
     <div class="blog-post-body">${mdToHtml(post.content)}</div>
   </article>`;
     return htmlResponse(blogShell({ title: `${post.title} — Colino`, description: post.excerpt || "", active: "blog", contentHtml }));
@@ -2982,6 +2986,7 @@ async function handlePostsWrite(request, env) {
     title,
     excerpt: sanitizeText(body.excerpt, 500),
     content: String(body.content || "").slice(0, 200000),
+    cover: sanitizeText(body.cover, 500) || (existing ? existing.cover : null),
     tags: sanitizeStringArray(body.tags, 20, 50),
     author: sanitizeText(body.author, 100) || "Colino",
     published_at: body.published_at ? sanitizeText(body.published_at, 40) : (existing ? existing.published_at : new Date().toISOString()),
@@ -2991,7 +2996,7 @@ async function handlePostsWrite(request, env) {
   const idx = await getPostIndex(env);
   if (!idx.includes(slug)) {
     idx.push(slug);
-    await env.JOBS_KV.put("post:index", JSON.stringify(idx));
+    await env.JOBS_KV.put("post:index:v2", JSON.stringify(idx));
   }
   return jsonResponse({ ok: true, post });
 }
@@ -3001,7 +3006,7 @@ async function handlePostsDelete(request, env, slug) {
   const s = slugify(slug);
   await env.JOBS_KV.delete("post:" + s);
   const idx = await getPostIndex(env);
-  await env.JOBS_KV.put("post:index", JSON.stringify(idx.filter((x) => x !== s)));
+  await env.JOBS_KV.put("post:index:v2", JSON.stringify(idx.filter((x) => x !== s)));
   return jsonResponse({ ok: true });
 }
 __name(handlePostsDelete, "handlePostsDelete");
@@ -3130,9 +3135,11 @@ You do not need a full portfolio. You need one real project that shows you can d
 Look for roles where your old domain and your new skill overlap. That is the fastest on-ramp, and the least competitive.` }
   ];
   for (const p of posts) {
+    // Deterministic placeholder cover per post; the CMS can override with a real image.
+    p.cover = `https://picsum.photos/seed/${p.slug}/1200/630`;
     await env.JOBS_KV.put("post:" + p.slug, JSON.stringify(p));
   }
-  await env.JOBS_KV.put("post:index", JSON.stringify(posts.map((p) => p.slug)));
+  await env.JOBS_KV.put("post:index:v2", JSON.stringify(posts.map((p) => p.slug)));
 }
 __name(seedPosts, "seedPosts");
 export {
