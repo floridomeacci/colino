@@ -112,15 +112,34 @@ var worker_default = {
 };
 async function handleGetJobs(env) {
   const jobs = await getAtsDb(env);
-  // Slim list payload: truncate descriptions (full text is fetched on demand).
-  const slim = jobs.map((j) => {
-    const rest = { ...j };
-    if (rest.description) rest.description = rest.description.slice(0, 400);
-    return rest;
-  });
-  return jsonResponse(slim);
+  return jsonResponse(jobs.map(slimJob));
 }
 __name(handleGetJobs, "handleGetJobs");
+function slimJob(j) {
+  return {
+    job_posting_id: j.job_posting_id,
+    url: j.url,
+    job_title: j.job_title,
+    company_name: j.company_name,
+    company_logo: j.company_logo,
+    job_location: j.job_location,
+    country: j.country,
+    job_posted_date: j.job_posted_date,
+    job_posted_time: j.job_posted_time,
+    job_seniority_level: j.job_seniority_level,
+    job_seniority: j.job_seniority,
+    seniority_raw: j.seniority_raw,
+    job_employment_type: j.job_employment_type,
+    job_num_applicants: j.job_num_applicants,
+    is_easy_apply: j.is_easy_apply,
+    base_salary: j.base_salary,
+    workplace_type: j.workplace_type,
+    is_active: j.is_active !== false,
+    collected_at: j.collected_at,
+    description: j.description ? String(j.description).slice(0, 180) : null
+  };
+}
+__name(slimJob, "slimJob");
 async function handleGetJobsStream(env) {
   const jobs = await getAtsDb(env);
   const enc = new TextEncoder();
@@ -130,10 +149,7 @@ async function handleGetJobsStream(env) {
       function push() {
         const CHUNK = 50;
         for (let n = 0; n < CHUNK && i < jobs.length; n++, i++) {
-          const j = jobs[i];
-          const rest = { ...j };
-          if (rest.description) rest.description = rest.description.slice(0, 400);
-          controller.enqueue(enc.encode(JSON.stringify(rest) + "\n"));
+          controller.enqueue(enc.encode(JSON.stringify(slimJob(jobs[i])) + "\n"));
         }
         if (i >= jobs.length) {
           controller.close();
@@ -1649,6 +1665,7 @@ async function storeCompanyJobs(company, env) {
     for (const j of existing) if (j.url) byUrl.set(j.url, j);
     for (const j of stamped) if (j.url) byUrl.set(j.url, j);
     await env.JOBS_KV.put(key, JSON.stringify([...byUrl.values()]));
+    await invalidateAtsCache(env);
   }
   return fresh;
 }
@@ -1700,40 +1717,56 @@ async function getAtsDb(env) {
   const cutoff = Date.now() - RETENTION_S * 1000;
   // Read all company keys in parallel.
   const batches = await Promise.all(list.keys.map((k) => env.JOBS_KV.get(k.name, { type: "json" })));
-  const all = [];
+  const raw = [];
   for (const jobs of batches) {
     if (!jobs) continue;
     for (const j of jobs) {
       if (!j.collected_at || j.collected_at >= cutoff) {
         if (isTestJob(j)) continue; // drop bogus/test postings from ATS boards
-        if (!j.country) j.country = inferCountry(j.job_location);
-        if (!j.company_logo) j.company_logo = logoFromJob(j);
-        if (j.job_seniority_level) {
-          j.seniority_raw = j.job_seniority_level;
-          j.job_seniority_level = normalizeJobSeniority(j.job_seniority_level);
-          j.job_seniority = canonicalSeniority(j.seniority_raw);
-        } else {
-          j.job_seniority = "unknown";
-        }
-        if (j.job_seniority === "unknown") {
-          const inferred = inferSeniorityFromTitle(j.job_title);
-          if (inferred !== "unknown") j.job_seniority = inferred;
-        }
-        j.last_verified_at = j.collected_at ? new Date(j.collected_at).toISOString() : null;
-        j.is_active = !!j.collected_at && j.collected_at >= cutoff;
-        j.company_name = normalizeCompanyName(j.company_name);
-        all.push(j);
+        raw.push(j);
       }
     }
   }
+  // Dedup, then cap to the most recent postings BEFORE normalizing, so we only pay
+  // the normalization cost (country/logo/seniority) on the jobs we actually serve.
   const seen = new Set();
-  return all.filter((j) => {
+  let deduped = raw.filter((j) => {
     if (seen.has(j.url)) return false;
     seen.add(j.url);
     return true;
   });
+  const MAX_JOBS = 3000;
+  if (deduped.length > MAX_JOBS) {
+    deduped.sort((a, b) => new Date(b.job_posted_date || 0) - new Date(a.job_posted_date || 0));
+    deduped = deduped.slice(0, MAX_JOBS);
+  }
+  for (const j of deduped) {
+    if (!j.country) j.country = inferCountry(j.job_location);
+    if (!j.company_logo) j.company_logo = logoFromJob(j);
+    if (j.job_seniority_level) {
+      j.seniority_raw = j.job_seniority_level;
+      j.job_seniority_level = normalizeJobSeniority(j.job_seniority_level);
+      j.job_seniority = canonicalSeniority(j.seniority_raw);
+    } else {
+      j.job_seniority = "unknown";
+    }
+    if (j.job_seniority === "unknown") {
+      const inferred = inferSeniorityFromTitle(j.job_title);
+      if (inferred !== "unknown") j.job_seniority = inferred;
+    }
+    j.last_verified_at = j.collected_at ? new Date(j.collected_at).toISOString() : null;
+    j.is_active = !!j.collected_at && j.collected_at >= cutoff;
+    j.company_name = normalizeCompanyName(j.company_name);
+  }
+  return deduped;
 }
 __name(getAtsDb, "getAtsDb");
+async function invalidateAtsCache(env) {
+  if (env && env.JOBS_KV) {
+    try { await env.JOBS_KV.delete("cache:atsdb"); } catch (e) {}
+  }
+}
+__name(invalidateAtsCache, "invalidateAtsCache");
 function isTestJob(j) {
   const company = String(j.company_name || "").toLowerCase();
   const title = String(j.job_title || "").toLowerCase();
