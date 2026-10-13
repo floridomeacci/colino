@@ -89,6 +89,21 @@ var worker_default = {
       if (url.pathname === "/api/job" && request.method === "POST") {
         return handleGetJob(request, env);
       }
+      if (url.pathname === "/api/posts" && request.method === "GET") {
+        return handlePostsList(request, env);
+      }
+      if (url.pathname === "/api/posts" && request.method === "POST") {
+        return handlePostsWrite(request, env);
+      }
+      if (url.pathname.startsWith("/api/posts/") && request.method === "DELETE") {
+        return handlePostsDelete(request, env, url.pathname.slice("/api/posts/".length));
+      }
+      if (url.pathname === "/blog" || url.pathname === "/blog/") {
+        return handleBlogList(request, env);
+      }
+      if (url.pathname.startsWith("/blog/")) {
+        return handleBlogPost(env, url.pathname.slice("/blog/".length));
+      }
       return env.ASSETS.fetch(request);
     } catch (err) {
       return jsonResponse({ error: err && err.message ? err.message : String(err) }, 500);
@@ -2721,6 +2736,372 @@ function scoreJob(job, profile) {
   return score;
 }
 __name(scoreJob, "scoreJob");
+// ─── Blog + CMS ───
+function htmlResponse(html, status = 200) {
+  return new Response(html, {
+    status,
+    headers: {
+      "Content-Type": "text/html; charset=utf-8",
+      "Cache-Control": "public, max-age=300",
+      "X-Content-Type-Options": "nosniff",
+      "Referrer-Policy": "no-referrer"
+    }
+  });
+}
+__name(htmlResponse, "htmlResponse");
+function escapeHtml(s) {
+  return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+__name(escapeHtml, "escapeHtml");
+function mdInline(s) {
+  return escapeHtml(s)
+    .replace(/`([^`]+)`/g, "<code>$1</code>")
+    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/\*([^*]+)\*/g, "<em>$1</em>")
+    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" rel="noopener">$1</a>');
+}
+__name(mdInline, "mdInline");
+function mdToHtml(md) {
+  const lines = String(md || "").split("\n");
+  let html = "";
+  let inList = false, listType = "", inCode = false, codeBuf = [];
+  const closeList = () => { if (inList) { html += `</${listType}>`; inList = false; } };
+  for (const raw of lines) {
+    const line = raw;
+    if (line.trim().startsWith("```")) {
+      if (inCode) { html += `<pre><code>${escapeHtml(codeBuf.join("\n"))}</code></pre>`; codeBuf = []; inCode = false; }
+      else inCode = true;
+      continue;
+    }
+    if (inCode) { codeBuf.push(line); continue; }
+    const t = line.trim();
+    if (!t) { closeList(); continue; }
+    if (t.startsWith("### ")) { closeList(); html += `<h3>${mdInline(t.slice(4))}</h3>`; continue; }
+    if (t.startsWith("## ")) { closeList(); html += `<h2>${mdInline(t.slice(3))}</h2>`; continue; }
+    if (t.startsWith("# ")) { closeList(); html += `<h1>${mdInline(t.slice(2))}</h1>`; continue; }
+    if (/^-{3,}\s*$/.test(t)) { closeList(); html += "<hr>"; continue; }
+    if (t.startsWith("> ")) { closeList(); html += `<blockquote>${mdInline(t.slice(2))}</blockquote>`; continue; }
+    const ul = t.match(/^[-*]\s+(.*)/);
+    if (ul) { if (!inList || listType !== "ul") { closeList(); html += "<ul>"; inList = true; listType = "ul"; } html += `<li>${mdInline(ul[1])}</li>`; continue; }
+    const ol = t.match(/^\d+[.)]\s+(.*)/);
+    if (ol) { if (!inList || listType !== "ol") { closeList(); html += "<ol>"; inList = true; listType = "ol"; } html += `<li>${mdInline(ol[1])}</li>`; continue; }
+    closeList();
+    html += `<p>${mdInline(t)}</p>`;
+  }
+  closeList();
+  if (inCode) html += `<pre><code>${escapeHtml(codeBuf.join("\n"))}</code></pre>`;
+  return html;
+}
+__name(mdToHtml, "mdToHtml");
+function slugify(s) {
+  return String(s || "").toLowerCase().trim().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+}
+__name(slugify, "slugify");
+function formatDate(iso) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "";
+  return d.toLocaleDateString("en-US", { year: "numeric", month: "long", day: "numeric" });
+}
+__name(formatDate, "formatDate");
+const BLOG_PAGE_SIZE = 6;
+async function getPostIndex(env) {
+  try {
+    const idx = await env.JOBS_KV.get("post:index", { type: "json" });
+    return Array.isArray(idx) ? idx : [];
+  } catch (e) {
+    return [];
+  }
+}
+__name(getPostIndex, "getPostIndex");
+async function getPosts(env) {
+  let slugs = await getPostIndex(env);
+  if (!slugs.length) {
+    await seedPosts(env);
+    slugs = await getPostIndex(env);
+  }
+  const batches = await Promise.all(slugs.map((s) => env.JOBS_KV.get("post:" + s, { type: "json" })));
+  const posts = batches.filter(Boolean).filter((p) => !p.draft);
+  posts.sort((a, b) => new Date(b.published_at || 0) - new Date(a.published_at || 0));
+  return posts;
+}
+__name(getPosts, "getPosts");
+function blogShell({ title, description, active, contentHtml }) {
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${escapeHtml(title)}</title>
+<meta name="description" content="${escapeHtml(description || "")}">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=DM+Serif+Display&family=DM+Sans:ital,opsz,wght@0,9..40,300..700;1,9..40,300..700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/style.css?v=30">
+</head>
+<body>
+<div class="page">
+  <header class="masthead">
+    <div class="masthead-inner">
+      <div class="masthead-left">
+        <div class="masthead-brand"><a href="/" style="text-decoration:none;color:inherit"><h1 class="masthead-title">Colino</h1></a></div>
+        <p class="masthead-tagline">Strain out the noise. Find the jobs that fit.</p>
+      </div>
+      <nav class="masthead-nav" aria-label="Primary">
+        <a href="/" class="masthead-nav-link${active === "search" ? " is-active" : ""}">Search</a>
+        <a href="/blog" class="masthead-nav-link${active === "blog" ? " is-active" : ""}" aria-current="${active === "blog" ? "page" : "false"}">Blog</a>
+      </nav>
+    </div>
+  </header>
+  ${contentHtml}
+  <footer class="site-footer" style="padding: var(--space-l) 0;">
+    <span>Built by <a href="https://floridomeacci.xyz" target="_blank" rel="noopener noreferrer">Florido Meacci</a></span>
+  </footer>
+</div>
+</body>
+</html>`;
+}
+__name(blogShell, "blogShell");
+async function handleBlogList(request, env) {
+  try {
+    const url = new URL(request.url);
+    const page = Math.max(1, parseInt(url.searchParams.get("page") || "1", 10) || 1);
+    const posts = await getPosts(env);
+    const totalPages = Math.max(1, Math.ceil(posts.length / BLOG_PAGE_SIZE));
+    const paged = posts.slice((page - 1) * BLOG_PAGE_SIZE, page * BLOG_PAGE_SIZE);
+    const cards = paged.map((p, i) => `
+    <article class="blog-card">
+      <a class="blog-card-link" href="/blog/${encodeURIComponent(p.slug)}">
+        <time datetime="${escapeHtml(p.published_at || "")}">${escapeHtml(formatDate(p.published_at))}</time>
+        <h2>${escapeHtml(p.title)}</h2>
+        <p>${escapeHtml(p.excerpt || "")}</p>
+        ${(p.tags || []).length ? `<div class="blog-card-tags">${p.tags.map((t) => `<span>${escapeHtml(t)}</span>`).join("")}</div>` : ""}
+      </a>
+    </article>`).join("");
+    const pageLinks = [];
+    for (let i = 1; i <= totalPages; i++) {
+      pageLinks.push(i === page
+        ? `<span class="is-current" aria-current="page">${i}</span>`
+        : `<a href="/blog?page=${i}">${i}</a>`);
+    }
+    const contentHtml = `
+  <section class="blog">
+    <div class="blog-head">
+      <h1 class="blog-title">The Colino Blog</h1>
+      <p class="blog-sub">Practical guides on finding work that fits, from writing your CV to negotiating the offer.</p>
+    </div>
+    ${cards ? `<div class="blog-grid">${cards}</div>` : `<p class="blog-empty">No posts yet.</p>`}
+    ${totalPages > 1 ? `<nav class="blog-pagination" aria-label="Blog pages">${pageLinks.join("")}</nav>` : ""}
+  </section>`;
+    return htmlResponse(blogShell({ title: "Blog — Colino", description: "Practical guides on finding work that fits.", active: "blog", contentHtml }));
+  } catch (err) {
+    return htmlResponse(`<h1>Error</h1><p>${escapeHtml(err && err.message ? err.message : String(err))}</p>`, 500);
+  }
+}
+__name(handleBlogList, "handleBlogList");
+async function handleBlogPost(env, slug) {
+  try {
+    const key = "post:" + slugify(slug);
+    const post = await env.JOBS_KV.get(key, { type: "json" });
+    if (!post || post.draft) {
+      return htmlResponse(blogShell({ title: "Not found — Colino", active: "blog", contentHtml: `<section class="blog"><div class="blog-empty"><h1>Post not found</h1><p><a href="/blog">Back to the blog</a></p></div></section>` }), 404);
+    }
+    const contentHtml = `
+  <article class="blog-post">
+    <a class="blog-post-back" href="/blog">&larr; All posts</a>
+    <header class="blog-post-header">
+      <time datetime="${escapeHtml(post.published_at || "")}">${escapeHtml(formatDate(post.published_at))}</time>
+      <h1>${escapeHtml(post.title)}</h1>
+      ${post.author ? `<p class="blog-post-author">By ${escapeHtml(post.author)}</p>` : ""}
+    </header>
+    <div class="blog-post-body">${mdToHtml(post.content)}</div>
+  </article>`;
+    return htmlResponse(blogShell({ title: `${post.title} — Colino`, description: post.excerpt || "", active: "blog", contentHtml }));
+  } catch (err) {
+    return htmlResponse(`<h1>Error</h1><p>${escapeHtml(err && err.message ? err.message : String(err))}</p>`, 500);
+  }
+}
+__name(handleBlogPost, "handleBlogPost");
+function checkAdmin(request, env) {
+  const token = env.BLOG_ADMIN_TOKEN;
+  if (!token) return false;
+  const auth = request.headers.get("Authorization") || "";
+  return auth === `Bearer ${token}`;
+}
+__name(checkAdmin, "checkAdmin");
+async function handlePostsList(request, env) {
+  if (!checkAdmin(request, env)) return jsonResponse({ error: "Unauthorized" }, 401);
+  const posts = await getPosts(env);
+  return jsonResponse({ posts, count: posts.length });
+}
+__name(handlePostsList, "handlePostsList");
+async function handlePostsWrite(request, env) {
+  if (!checkAdmin(request, env)) return jsonResponse({ error: "Unauthorized" }, 401);
+  const body = await readJsonBody(request);
+  const title = sanitizeText(body.title, 200);
+  if (!title) return jsonResponse({ error: "Title is required" }, 400);
+  const slug = slugify(body.slug || title);
+  if (!slug) return jsonResponse({ error: "Invalid slug" }, 400);
+  const existing = await env.JOBS_KV.get("post:" + slug, { type: "json" });
+  const post = {
+    slug,
+    title,
+    excerpt: sanitizeText(body.excerpt, 500),
+    content: String(body.content || "").slice(0, 200000),
+    tags: sanitizeStringArray(body.tags, 20, 50),
+    author: sanitizeText(body.author, 100) || "Colino",
+    published_at: body.published_at ? sanitizeText(body.published_at, 40) : (existing ? existing.published_at : new Date().toISOString()),
+    draft: !!body.draft
+  };
+  await env.JOBS_KV.put("post:" + slug, JSON.stringify(post));
+  const idx = await getPostIndex(env);
+  if (!idx.includes(slug)) {
+    idx.push(slug);
+    await env.JOBS_KV.put("post:index", JSON.stringify(idx));
+  }
+  return jsonResponse({ ok: true, post });
+}
+__name(handlePostsWrite, "handlePostsWrite");
+async function handlePostsDelete(request, env, slug) {
+  if (!checkAdmin(request, env)) return jsonResponse({ error: "Unauthorized" }, 401);
+  const s = slugify(slug);
+  await env.JOBS_KV.delete("post:" + s);
+  const idx = await getPostIndex(env);
+  await env.JOBS_KV.put("post:index", JSON.stringify(idx.filter((x) => x !== s)));
+  return jsonResponse({ ok: true });
+}
+__name(handlePostsDelete, "handlePostsDelete");
+async function seedPosts(env) {
+  const now = new Date();
+  const daysAgo = (n) => new Date(now.getTime() - n * 86400000).toISOString();
+  const posts = [
+    { slug: "cv-that-gets-past-the-screen", title: "How to write a CV that gets past the first screen", excerpt: "Recruiters spend seconds on a first pass. Here is how to make those seconds count.", tags: ["CV", "Job search"], author: "Florido Meacci", published_at: daysAgo(2), content: `Your CV has about six seconds to earn a longer look. Most CVs fail that test, not because the candidate is weak, but because the document hides the signal in noise.
+
+## Lead with impact, not duties
+
+Recruiters skim for outcomes. Replace "responsible for X" with "shipped X, which led to Y".
+
+- Instead of "managed a design system", write "built a design system adopted by 4 teams, cutting handoff time by a third".
+- Instead of "worked on marketing", write "ran a channel that grew signups 40% quarter over quarter".
+
+## Match the language of the role
+
+Job descriptions are written in the hiring team's vocabulary. Mirror it. If the posting says "creative technologist", do not call yourself a "multidisciplinary maker". Use their words.
+
+## One page is enough
+
+Unless you have fifteen years of hard-to-summarise experience, keep it to a page. Every line that is not helping you is hurting you.` },
+    { slug: "what-matters-in-a-job-description", title: "What actually matters in a job description", excerpt: "Job posts hide more than they say. Learn which lines to read closely and which to skip.", tags: ["Job search", "Reading the market"], author: "Florido Meacci", published_at: daysAgo(5), content: `A job description is a wish list, not a contract. Treat it accordingly.
+
+## The salary line
+
+If a range is listed, it tells you the band. If it is not, that is itself information. Companies that hide salary often negotiate from weakness.
+
+## "Must have" versus "nice to have"
+
+Almost every requirement is negotiable. Research shows people apply when they meet roughly 60% of a posting. Do not self-reject.
+
+## The fine print
+
+Look for the workplace type, the location policy, and any line about travel or on-call. These reveal the real working conditions faster than the bullet list above them.` },
+    { slug: "prepare-product-designer-interview", title: "How to prepare for a product designer interview", excerpt: "A portfolio is not the interview. Here is what panels actually grade.", tags: ["Interviews", "Design"], author: "Florido Meacci", published_at: daysAgo(8), content: `Most candidates over-invest in the portfolio and under-invest in the conversation around it.
+
+## The three questions behind every question
+
+Design interviews reduce to three checks:
+
+1. Can you frame a problem before solving it?
+2. Can you defend a decision with evidence?
+3. Can you collaborate when pushed?
+
+## Tell the story, not the screens
+
+For each portfolio piece, prepare the narrative: the constraint, the tradeoff, the result. Screens are supporting evidence, not the pitch.
+
+## Prepare one sharp question
+
+At the end, ask something that shows you understand their product, not something generic. It is the cheapest differentiator available.` },
+    { slug: "remote-work-timezones", title: "Remote work: how to find roles that fit your timezone", excerpt: "Remote does not mean any timezone. Match your hours to the job before you apply.", tags: ["Remote", "Job search"], author: "Florido Meacci", published_at: daysAgo(11), content: `Remote job boards show thousands of roles, but most are region-locked in a way the title hides.
+
+## Read the location line closely
+
+"Remote" alone is meaningless. "Remote EU", "Remote US", or "Remote (within 2 hours of CET)" are the real constraints. Filter by the region, not the word remote.
+
+## Ask in the first conversation
+
+If the region is unclear, ask directly. It saves both sides a wasted interview loop.
+
+## Timezone overlap beats timezone match
+
+What matters is the overlap window, not where you sleep. A three-hour overlap can be plenty for async work, and painful for meeting-heavy roles.` },
+    { slug: "read-between-the-lines-job-posting", title: "How to read between the lines of a job posting", excerpt: "Red flags and green flags hide in the wording. Here is how to spot them.", tags: ["Job search", "Reading the market"], author: "Florido Meacci", published_at: daysAgo(15), content: `Job posts are marketing copy written by a company about itself. Read them like a critic.
+
+## Phrases that signal trouble
+
+- "Fast-paced environment" often means "understaffed".
+- "Wear many hats" means "no defined role".
+- "Rockstar" or "ninja" means "we have not thought about what we need".
+
+## Phrases that signal health
+
+- A specific salary range.
+- A named manager or team.
+- Concrete goals for the first 90 days.
+
+## Cross-check with the company
+
+The posting is one data point. Look at how long similar roles have been open, and what current employees say. A job board listing is a snapshot, not a verdict.` },
+    { slug: "salary-negotiation-practical-guide", title: "Salary negotiation: a practical guide", excerpt: "The offer is the start of a conversation, not the end of one.", tags: ["Offers", "Salary"], author: "Florido Meacci", published_at: daysAgo(19), content: `Negotiation is uncomfortable, which is exactly why it works for people who do it.
+
+## Do your homework before the number
+
+Know the band for the role, the company, and the city. A number without a benchmark is a guess, and guesses lose.
+
+## Let them go first
+
+If you can, let the company state a number. If you must answer first, give a range anchored to research, not to your current salary.
+
+## Negotiate the package, not the salary
+
+Base pay is one lever. There is also sign-on, equity, holiday, remote flexibility, and start date. When base is capped, trade there.
+
+## Stay warm
+
+The tone matters as much as the number. You are negotiating with people you will work with. Be direct and friendly.` },
+    { slug: "portfolio-tips-creative-technologists", title: "Portfolio tips for creative technologists", excerpt: "Your work is interactive. Show it like it is interactive, not like it is flat.", tags: ["Portfolio", "Creative tech"], author: "Florido Meacci", published_at: daysAgo(23), content: `Creative technologists sit between design and engineering, which makes the portfolio the hardest part to get right.
+
+## Show the thing working
+
+A creative technologist portfolio should run, not just look. Embed the prototype, the installation, the interaction. A video is a fallback, never the default.
+
+## Explain the "how" briefly
+
+Hiring managers want to know what you actually built versus what a team built. One line of honest attribution beats a wall of credentials.
+
+## Show the range
+
+Include one piece that is pure craft, one that is pure engineering, and one that bridges them. That triangle is your value.` },
+    { slug: "switching-careers-into-tech", title: "How to switch careers into tech without starting over", excerpt: "Your previous career is an asset, not a liability. Here is how to frame it.", tags: ["Career change", "Tech"], author: "Florido Meacci", published_at: daysAgo(28), content: `Career switchers assume they start from zero. The opposite is usually true.
+
+## Your domain is your leverage
+
+A nurse moving into health-tech, a teacher into ed-tech, a designer into product: you bring context that new graduates cannot. Lead with that context.
+
+## Build one credible proof
+
+You do not need a full portfolio. You need one real project that shows you can do the work. Depth beats breadth for a switcher.
+
+## Target the bridge role
+
+Look for roles where your old domain and your new skill overlap. That is the fastest on-ramp, and the least competitive.` }
+  ];
+  for (const p of posts) {
+    await env.JOBS_KV.put("post:" + p.slug, JSON.stringify(p));
+  }
+  await env.JOBS_KV.put("post:index", JSON.stringify(posts.map((p) => p.slug)));
+}
+__name(seedPosts, "seedPosts");
 export {
   worker_default as default
 };
