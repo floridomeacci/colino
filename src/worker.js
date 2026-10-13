@@ -3,6 +3,17 @@ var __name = (target, value) => __defProp(target, "name", { value, configurable:
 
 // src/worker.js
 var worker_default = {
+  async scheduled(event, env, ctx) {
+    try {
+      console.log("[cron] seed collection started");
+      const jobs = await collectAtsJobs(SEED_COMPANIES, env);
+      await env.JOBS_KV.put("seed:last_collection", new Date().toISOString());
+      await env.JOBS_KV.put("seed:last_count", String(jobs.length));
+      console.log("[cron] seed collection done, jobs=", jobs.length);
+    } catch (e) {
+      console.error("[cron] seed collection failed", e && e.message ? e.message : e);
+    }
+  },
   async fetch(request, env, ctx) {
     try {
       const url = new URL(request.url);
@@ -53,6 +64,9 @@ var worker_default = {
       }
       if (url.pathname === "/api/collect-ats" && request.method === "POST") {
         return handleCollectAts(request, env);
+      }
+      if (url.pathname === "/api/refresh" && request.method === "POST") {
+        return handleRefresh(request, env);
       }
       if (url.pathname === "/api/chat" && request.method === "POST") {
         return handleChat(request, env);
@@ -285,6 +299,21 @@ async function handleCollectAts(request, env) {
   }
 }
 __name(handleCollectAts, "handleCollectAts");
+async function handleRefresh(request, env) {
+  try {
+    const body = await readJsonBody(request);
+    const companies = sanitizeStringArray(body.companies, 200, 100).length
+      ? sanitizeStringArray(body.companies, 200, 100)
+      : SEED_COMPANIES;
+    const jobs = await collectAtsJobs(companies.slice(0, 200), env);
+    await env.JOBS_KV.put("seed:last_collection", new Date().toISOString());
+    await env.JOBS_KV.put("seed:last_count", String(jobs.length));
+    return jsonResponse({ jobs: jobs.length, count: jobs.length, companies: companies.length });
+  } catch (err) {
+    return jsonResponse({ error: err.message }, err.status || 500);
+  }
+}
+__name(handleRefresh, "handleRefresh");
 async function handleChat(request, env) {
   try {
     const body = await readJsonBody(request);
@@ -1548,6 +1577,27 @@ async function collectAtsJobs(companies, env) {
   });
 }
 __name(collectAtsJobs, "collectAtsJobs");
+// Seed employers collected on a weekly cron so the catalogue stays fresh and
+// within the 30-day retention window. Names are ATS slugs; if a slug doesn't
+// resolve on any board the collector just returns empty for that company.
+const SEED_COMPANIES = [
+  "Spotify", "Airbnb", "Duolingo", "Robinhood", "Datadog", "Notion", "Figma",
+  "DoorDash", "Instacart", "Coinbase", "GitLab", "Reddit", "Discord", "Vercel",
+  "Cloudflare", "Asana", "Brex", "Chime", "Deel", "Dropbox", "Gusto", "HubSpot",
+  "Lattice", "Linear", "Miro", "OpenAI", "Palantir", "Ramp", "Rippling", "ScaleAI",
+  "Snyk", "Square", "Stripe", "Twilio", "Zapier", "Zoom", "Atlassian", "Netflix",
+  "Shopify", "Canva", "DocuSign", "MongoDB", "Elastic", "Snowflake", "CrowdStrike",
+  "Okta", "ServiceNow", "Workday", "Salesforce", "Adobe", "Uber", "Lyft", "Pinterest",
+  "Snap", "TikTok", "ByteDance", "Spotify", "Wise", "Revolut", "Adyen", "Klarna",
+  "Monzo", "Plaid", "Figma", "TheTradeDesk", "Grammarly", "Duolingo", "Patreon",
+  "Kickstarter", "Substack", "Medium", "Automattic", "Webflow", "Airtable", "Coda",
+  "Retool", "Vercel", "Supabase", "Prisma", "Render", "Fly", "PlanetScale", "Neon",
+  "Resend", "Clerk", "WorkOS", "Sentry", "LaunchDarkly", "Optimizely", "Amplitude",
+  "Segment", "Intercom", "Zendesk", "Freshworks", "Calendly", "Zapier", "Aha",
+  "Booking", "TomTom", "ASML", "Philips", "ING", "Rabobank", "Heineken", "Mollie",
+  "MessageBird", "Zalando", "Personio", "Celonis", "DeepL", "BendingSpoons",
+  "Remote", "Deliveroo", "N26", "Spotify"
+];
 const RETENTION_S = 30 * 86400;
 function atsKey(company) {
   return `ats:${String(company).toLowerCase().replace(/[^a-z0-9]+/g, "")}`;

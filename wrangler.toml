@@ -17,3 +17,6 @@ id = "974bea3f3c544003b8941c9cdad18815"
 [[routes]]
 pattern = "colino.work"
 custom_domain = true
+
+[triggers]
+crons = ["0 0 * * 1"]
